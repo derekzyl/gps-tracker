@@ -40,6 +40,7 @@
 #include <HardwareSerial.h>
 #include <TinyGPS++.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 
 // ═══════════════════════════════════════════════════════════
 //  PIN DEFINITIONS
@@ -86,6 +87,10 @@
 #define BTN_LONG_MS           3000
 #define INTERNET_TEST_MS      4000
 #define PROV_LCD_ROTATE_MS    3000
+#define HEARTBEAT_MS          30000
+#define GEO_SYNC_MS           300000
+#define QUEUE_SIZE            12
+#define MAX_DYN_ZONES         16
 
 #define AP_SSID               "GPS-SpeedMonitor"
 #define AP_PASS               "speed1234"
