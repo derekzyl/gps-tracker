@@ -1082,125 +1082,117 @@ static const char PAGE_CSS[] PROGMEM = R"CSS(
 :root{--ink:#0b1f33;--soft:#3d5166;--mut:#6b7c8f;--line:#d5dee8;--bg:#eef3f7;
 --card:#fff;--teal:#0f9d8a;--td:#0a7a6b;--amber:#d97706;--rose:#be123c;--sky:#0284c7;
 --sh:0 10px 32px rgba(11,31,51,.08);--r:14px}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:
-radial-gradient(900px 420px at 8% -8%,rgba(15,157,138,.14),transparent 55%),
-radial-gradient(700px 380px at 100% 0,rgba(2,132,199,.1),transparent 50%),var(--bg);
-color:var(--ink);min-height:100vh}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--ink);min-height:100vh}
 .wrap{max-width:960px;margin:0 auto;padding:20px 16px 40px}
 .top{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 .brand{display:flex;align-items:center;gap:12px}
-.logo{width:42px;height:42px;border-radius:11px;background:linear-gradient(145deg,#0b1f33,#163552);
-color:#9ef0e2;display:grid;place-items:center;font:600 .85rem ui-monospace,monospace;box-shadow:0 8px 20px rgba(11,31,51,.25)}
-.brand h1{font-size:1.45rem;letter-spacing:-.03em;line-height:1}
-.brand h1 b{color:var(--teal);font-weight:700}
-.brand p{color:var(--mut);font-size:.8rem;margin-top:4px}
+.logo{width:42px;height:42px;border-radius:11px;background:#0b1f33;color:#9ef0e2;display:grid;place-items:center;font:600 .85rem monospace}
+.brand h1{font-size:1.45rem;letter-spacing:-.03em;line-height:1;margin:0}
+.brand h1 b{color:var(--teal)}
+.brand p{color:var(--mut);font-size:.8rem;margin:4px 0 0}
 .nav{display:flex;gap:8px;flex-wrap:wrap}
-.nav a{text-decoration:none;color:var(--soft);background:var(--card);border:1px solid var(--line);
-border-radius:999px;padding:8px 14px;font-size:.8rem;font-weight:600;box-shadow:var(--sh)}
-.nav a.on,.nav a:hover{color:var(--td);border-color:#b7e0d8}
-.pill{display:inline-flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--line);
-border-radius:999px;padding:7px 12px;font-size:.75rem;color:var(--soft);box-shadow:var(--sh)}
-.dot{width:8px;height:8px;border-radius:50%}
-.dok{background:var(--teal);box-shadow:0 0 0 3px rgba(15,157,138,.2)}
-.derr{background:var(--rose);box-shadow:0 0 0 3px rgba(190,18,60,.2)}
-.dwrn{background:var(--amber);box-shadow:0 0 0 3px rgba(217,119,6,.2)}
-.hero{background:linear-gradient(135deg,rgba(15,157,138,.09),transparent 48%),var(--card);
-border:1px solid var(--line);border-radius:var(--r);padding:20px 22px;box-shadow:var(--sh);margin-bottom:16px}
-.eyebrow{font:500 .68rem ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin-bottom:8px}
-.hero h2{font-size:1.35rem;letter-spacing:-.02em}
-.hero h2.ok{color:var(--td)}.hero h2.bad{color:var(--rose)}
-.hero .sub{color:var(--soft);font-size:.9rem;margin-top:6px;line-height:1.45;max-width:48ch}
+.nav a{text-decoration:none;color:var(--soft);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:8px 14px;font-size:.8rem;font-weight:600}
+.nav a.on{color:var(--td);border-color:#b7e0d8}
+.pill{display:inline-flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:7px 12px;font-size:.75rem;color:var(--soft)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dok{background:var(--teal)}.derr{background:var(--rose)}.dwrn{background:var(--amber)}
+.hero{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:20px 22px;box-shadow:var(--sh);margin-bottom:16px}
+.eyebrow{font:500 .68rem monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin-bottom:8px}
+.hero h2{font-size:1.35rem;margin:0}.hero h2.ok{color:var(--td)}.hero h2.bad{color:var(--rose)}
+.hero .sub{color:var(--soft);font-size:.9rem;margin-top:6px;line-height:1.45}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
-.chip{font:500 .7rem ui-monospace,monospace;background:#eef5f3;color:var(--td);border:1px solid #cce8e2;
-border-radius:8px;padding:5px 9px}
+.chip{font:500 .7rem monospace;background:#eef5f3;color:var(--td);border:1px solid #cce8e2;border-radius:8px;padding:5px 9px}
 .chip.warn{background:#fff4e5;color:#9a5b05;border-color:#f5d7a6}
-.chip.rose{background:#fde8ec;color:var(--rose);border-color:#f5c2cd}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px}
 .kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;box-shadow:var(--sh)}
 .kpi .l{font-size:.68rem;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
-.kpi .v{font:600 1.7rem ui-monospace,monospace;margin-top:4px;letter-spacing:-.02em}
-.kpi .u{font-size:.7rem;color:var(--mut);margin-top:2px}
+.kpi .v{font:600 1.7rem monospace;margin-top:4px}.kpi .u{font-size:.7rem;color:var(--mut)}
 .safe{color:var(--td)}.warn{color:var(--amber)}.danger{color:var(--rose)}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:14px;overflow:hidden}
-.phd{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px}
-.phd h3{font-size:.92rem}
-.pbd{padding:14px 16px}
+.phd{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+.phd h3{font-size:.92rem;margin:0}.pbd{padding:14px 16px}
 .fs{margin:0 0 14px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh)}
-.fs.hi{border-color:#9ad9ce;background:linear-gradient(180deg,#f3fbf9,#fff)}
-.fs h2{font-size:.95rem;margin-bottom:4px}
-.fs .lead{color:var(--mut);font-size:.8rem;margin-bottom:12px;line-height:1.4}
-label{display:block;font-size:.78rem;color:var(--soft);margin:12px 0 5px;font-weight:600}
-input,select{width:100%;background:#f7fafc;border:1px solid var(--line);border-radius:9px;
-padding:11px 12px;color:var(--ink);font:inherit;font-size:.92rem}
-input:focus{outline:2px solid rgba(15,157,138,.35);border-color:var(--teal)}
+.fs.hi{border:2px solid var(--teal);background:#f3fbf9}
+.fs h2{font-size:1rem;margin:0 0 4px}.fs .lead{color:var(--mut);font-size:.8rem;margin:0 0 12px;line-height:1.4}
+label{display:block;font-size:.8rem;color:var(--soft);margin:14px 0 6px;font-weight:600}
+input,select{display:block;width:100%;min-height:48px;background:#fff;border:2px solid #9eb6c8;border-radius:10px;
+padding:12px 14px;color:var(--ink);font:inherit;font-size:1rem;-webkit-appearance:none;appearance:none}
+input:focus{outline:none;border-color:var(--teal);box-shadow:0 0 0 3px rgba(15,157,138,.2)}
 .hint{font-size:.72rem;color:var(--mut);margin-top:6px;line-height:1.35}
-.btn{display:inline-block;padding:11px 18px;border-radius:10px;border:none;font:600 .88rem system-ui,sans-serif;
-cursor:pointer;text-decoration:none;margin:8px 8px 0 0}
-.bp{background:var(--teal);color:#fff}.bp:hover{background:var(--td)}
-.bd{background:var(--rose);color:#fff}
+.btn{display:inline-block;padding:12px 18px;border-radius:10px;border:none;font:600 .9rem system-ui,sans-serif;cursor:pointer;text-decoration:none;margin:10px 8px 0 0}
+.bp{background:var(--teal);color:#fff}.bd{background:var(--rose);color:#fff}
 .bg{background:var(--card);color:var(--ink);border:1px solid var(--line)}
-.pi{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-.pi input{flex:1}
+.pi{display:flex;gap:8px;align-items:center;margin-bottom:8px}.pi input{flex:1}
 .rm,.add{border:none;border-radius:8px;padding:9px 12px;cursor:pointer;font-size:.8rem;font-weight:600}
 .rm{background:#fde8ec;color:var(--rose)}.add{background:#e6f4fc;color:#0369a1;margin-top:4px}
-.mok{padding:11px 14px;border-radius:10px;margin-bottom:12px;font-size:.84rem;
-background:#e8f7f3;border:1px solid #9ad9ce;color:var(--td)}
-.merr{padding:11px 14px;border-radius:10px;margin-bottom:12px;font-size:.84rem;
-background:#fde8ec;border:1px solid #f5c2cd;color:var(--rose)}
+.mok{padding:11px 14px;border-radius:10px;margin-bottom:12px;font-size:.84rem;background:#e8f7f3;border:1px solid #9ad9ce;color:var(--td)}
+.merr{padding:11px 14px;border-radius:10px;margin-bottom:12px;font-size:.84rem;background:#fde8ec;border:1px solid #f5c2cd;color:var(--rose)}
 table{width:100%;border-collapse:collapse;font-size:.8rem}
-th{text-align:left;padding:9px 12px;color:var(--mut);font-size:.68rem;text-transform:uppercase;
-letter-spacing:.05em;border-bottom:1px solid var(--line);background:#f7fafc}
+th{text-align:left;padding:9px 12px;color:var(--mut);font-size:.68rem;text-transform:uppercase;border-bottom:1px solid var(--line);background:#f7fafc}
 td{padding:10px 12px;border-bottom:1px solid #eef2f6}
 .SEVERE{color:var(--rose);font-weight:700}.MODERATE{color:var(--amber);font-weight:600}.MINOR{color:var(--sky)}
-.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:.7rem;background:#eef5f3;
-border:1px solid #cce8e2;color:var(--td);margin:0 4px 4px 0}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:.7rem;background:#eef5f3;border:1px solid #cce8e2;color:var(--td);margin:0 4px 4px 0}
 .foot{margin-top:18px;color:var(--mut);font-size:.72rem;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.foot a{color:var(--td);text-decoration:none}
-.onb{max-width:440px;margin:28px auto}
-.ipbox{font:600 1.05rem ui-monospace,monospace;color:var(--td);background:#e8f7f3;border:1px solid #9ad9ce;
-border-radius:12px;padding:14px;text-align:center;margin:14px 0}
-.steps{margin:12px 0 4px;padding-left:18px;color:var(--soft);font-size:.84rem;line-height:1.55}
-.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
-.empty{color:var(--mut);padding:18px;text-align:center;font-size:.85rem}
+.foot a{color:var(--td)}
+.onb{max-width:480px;margin:12px auto}
+.ipbox{font:600 1rem monospace;color:var(--td);background:#e8f7f3;border:1px solid #9ad9ce;border-radius:12px;padding:14px;text-align:center;margin:14px 0}
+.steps{margin:12px 0;padding-left:18px;color:var(--soft);font-size:.84rem;line-height:1.55}
+.mono{font-family:monospace}.empty{color:var(--mut);padding:18px;text-align:center}
 </style>
 )CSS";
 
 static void htmlHead(const char* title, bool autoRefresh = false) {
-    webServer.sendContent(F("<!DOCTYPE html><html lang='en'><head>"
-        "<meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"));
-    if (autoRefresh) webServer.sendContent(F("<meta http-equiv='refresh' content='4'>"));
+    webServer.sendContent(F("<!DOCTYPE html><html lang=en><head>"
+        "<meta charset=UTF-8>"
+        "<meta name=viewport content=\"width=device-width,initial-scale=1\">"));
+    if (autoRefresh) webServer.sendContent(F("<meta http-equiv=refresh content=4>"));
     webServer.sendContent(F("<title>"));
     webServer.sendContent(title);
     webServer.sendContent(F("</title>"));
-    webServer.sendContent(PAGE_CSS);
-    webServer.sendContent(F("</head><body><div class='wrap'>"));
+    // FPSTR: send PROGMEM CSS correctly (plain sendContent can truncate/mangle)
+    webServer.sendContent_P(PAGE_CSS);
+    webServer.sendContent(F("</head><body><div class=wrap>"));
 }
 
 static void htmlTop(const char* active) {
     webServer.sendContent(F(
-        "<div class='top'><div class='brand'><div class='logo'>VX</div><div>"
-        "<h1>Veloc<b>is</b></h1><p>Device console</p></div></div><nav class='nav'>"));
+        "<div class=top><div class=brand><div class=logo>VX</div><div>"
+        "<h1>Veloc<b>is</b></h1><p>Device console</p></div></div><nav class=nav>"));
 
-    webServer.sendContent(F("<a href='/'"));
-    if (strcmp(active, "live") == 0) webServer.sendContent(F(" class='on'"));
+    webServer.sendContent(F("<a href=/"));
+    if (strcmp(active, "live") == 0) webServer.sendContent(F(" class=on"));
     webServer.sendContent(F(">Live</a>"));
 
-    webServer.sendContent(F("<a href='/wifi'"));
-    if (strcmp(active, "wifi") == 0) webServer.sendContent(F(" class='on'"));
+    webServer.sendContent(F("<a href=/wifi"));
+    if (strcmp(active, "wifi") == 0) webServer.sendContent(F(" class=on"));
     webServer.sendContent(F(">Wi-Fi Setup</a>"));
 
-    webServer.sendContent(F("<a href='/settings'"));
-    if (strcmp(active, "settings") == 0) webServer.sendContent(F(" class='on'"));
+    webServer.sendContent(F("<a href=/settings"));
+    if (strcmp(active, "settings") == 0) webServer.sendContent(F(" class=on"));
     webServer.sendContent(F(">Settings</a></nav></div>"));
 }
 
 static void htmlFoot() {
     webServer.sendContent(F(
-        "<div class='foot'><span>Velocis device firmware</span>"
-        "<span><a href='/api/status'>API status</a> · <a href='/wifi'>Wi-Fi setup</a></span>"
+        "<div class=foot><span>Velocis device firmware</span>"
+        "<span><a href=/api/status>API status</a> · <a href=/wifi>Wi-Fi setup</a></span>"
         "</div></div></body></html>"));
+}
+
+// Escape so SSID never breaks value='...'
+static void sendHtmlAttr(const char* s) {
+    if (!s) return;
+    for (; *s; ++s) {
+        if (*s == '&')      webServer.sendContent(F("&amp;"));
+        else if (*s == '\'') webServer.sendContent(F("&#39;"));
+        else if (*s == '"')  webServer.sendContent(F("&quot;"));
+        else if (*s == '<')  webServer.sendContent(F("&lt;"));
+        else {
+            char c[2] = { *s, 0 };
+            webServer.sendContent(c);
+        }
+    }
 }
 
 // ── Wi-Fi onboarding (captive portal target) ─────────────────
@@ -1211,53 +1203,47 @@ void sendWifiSetup() {
     htmlHead("Wi-Fi Setup — Velocis");
     htmlTop("wifi");
 
+    // FORM FIRST — SoftAP pages sometimes truncate; inputs must be early
     webServer.sendContent(F(
-        "<div class='onb'>"
-        "<div class='hero' style='text-align:center'>"
-        "<div class='eyebrow'>Network onboarding</div>"
+        "<div class=onb>"
+        "<div class='fs hi'>"
         "<h2>Enter Wi-Fi name &amp; password</h2>"
-        "<p class='sub' style='margin-left:auto;margin-right:auto'>"
-        "This is where you connect the tracker to your home or office Wi-Fi. "
-        "Use the network name (SSID) and password from your router.</p>"
-        "</div>"));
+        "<p class=lead>Type your home/office network below, then tap Save &amp; Connect.</p>"
+        "<form method=POST action=/wifi>"
+        "<label for=wifiSSID>Wi-Fi name (SSID)</label>"
+        "<input id=wifiSSID name=wifiSSID type=text required maxlength=63 "
+        "placeholder=\"Your network name\" value=\""));
+    sendHtmlAttr(cfg.wifiSSID);
+    webServer.sendContent(F("\" autocomplete=off autocapitalize=none spellcheck=false>"
+        "<label for=wifiPass>Wi-Fi password</label>"
+        "<input id=wifiPass name=wifiPass type=text maxlength=63 "
+        "placeholder=\"Your network password\" value=\""));
+    sendHtmlAttr(cfg.wifiPass);
+    webServer.sendContent(F("\" autocomplete=off autocapitalize=none spellcheck=false>"
+        "<p class=hint>Not the hotspot password. Leave blank only for open networks.</p>"
+        "<button class=\"btn bp\" type=submit>Save &amp; Connect</button>"
+        "</form></div>"));
+
+    if (webServer.hasArg("err"))
+        webServer.sendContent(F("<div class=merr>Could not join that network. Check name/password and try again.</div>"));
+    if (webServer.hasArg("ok"))
+        webServer.sendContent(F("<div class=mok>Saved. Connecting &amp; testing internet…</div>"));
 
     {
-        char buf[220];
+        char buf[240];
         IPAddress ip = state.apActive ? WiFi.softAPIP() : currentDeviceIP();
         snprintf(buf, sizeof(buf),
-            "<div class='ipbox'>Open http://%s/wifi</div>"
-            "<ol class='steps'>"
-            "<li>Join phone Wi-Fi: <b>%s</b> / pass <b>%s</b></li>"
-            "<li>Type your <b>home Wi-Fi name</b> below</li>"
-            "<li>Type your <b>home Wi-Fi password</b></li>"
-            "<li>Tap <b>Save &amp; Connect</b> — device tests internet</li>"
-            "</ol>",
+            "<div class=ipbox>http://%s/wifi</div>"
+            "<ol class=steps>"
+            "<li>Join phone to <b>%s</b> (pass <b>%s</b>)</li>"
+            "<li>Fill the fields above with your router Wi-Fi</li>"
+            "<li>Tap Save &amp; Connect</li>"
+            "</ol>"
+            "<p class=hint style=\"text-align:center\"><a href=/settings>All settings</a></p>"
+            "</div>",
             ip.toString().c_str(), AP_SSID, AP_PASS);
         webServer.sendContent(buf);
     }
-
-    if (webServer.hasArg("err"))
-        webServer.sendContent(F("<div class='merr'>Could not join that network. Check the name and password, then try again.</div>"));
-    if (webServer.hasArg("ok"))
-        webServer.sendContent(F("<div class='mok'>Saved. Connecting &amp; testing internet…</div>"));
-
-    webServer.sendContent(F(
-        "<form method='POST' action='/wifi'>"
-        "<div class='fs hi'>"
-        "<h2>Your Wi-Fi credentials</h2>"
-        "<p class='lead'>Put the network name and password here — not the hotspot password shown above.</p>"
-        "<label for='wifiSSID'>Wi-Fi name (SSID)</label>"
-        "<input id='wifiSSID' name='wifiSSID' required maxlength='63' "
-        "placeholder='e.g. HomeFiber / Office-WiFi' value='"));
-    webServer.sendContent(cfg.wifiSSID);
-    webServer.sendContent(F("' autocomplete='username'>"
-        "<label for='wifiPass'>Wi-Fi password</label>"
-        "<input id='wifiPass' name='wifiPass' type='password' maxlength='63' "
-        "placeholder='Router / network password' autocomplete='current-password'>"
-        "<p class='hint'>Stored only on this device (NVS). Leave password blank for open networks.</p>"
-        "<button class='btn bp' type='submit'>Save &amp; Connect</button>"
-        "<a class='btn bg' href='/settings'>All settings</a>"
-        "</div></form></div>"));
 
     htmlFoot();
     webServer.sendContent("");
@@ -1407,18 +1393,18 @@ void sendSettings() {
     webServer.sendContent(F(
         "<div class='fs hi'>"
         "<h2>Wi-Fi name &amp; password</h2>"
-        "<p class='lead'>Enter your home/office network here. After save, the device reconnects and tests internet.</p>"
-        "<label for='wifiSSID'>Wi-Fi name (SSID)</label>"
-        "<input id='wifiSSID' name='wifiSSID' maxlength='63' placeholder='Network name' value='"));
-    webServer.sendContent(cfg.wifiSSID);
-    webServer.sendContent(F("'>"
-        "<label for='wifiPass'>Wi-Fi password</label>"
-        "<input id='wifiPass' name='wifiPass' type='password' maxlength='63' value='"));
-    webServer.sendContent(cfg.wifiPass);
-    webServer.sendContent(F("'>"
-        "<p class='hint'>Clear the Wi-Fi name and save to reopen setup hotspot "
+        "<p class=lead>Enter your home/office network here. After save, the device reconnects and tests internet.</p>"
+        "<label for=wifiSSID>Wi-Fi name (SSID)</label>"
+        "<input id=wifiSSID name=wifiSSID type=text maxlength=63 placeholder=\"Network name\" value=\""));
+    sendHtmlAttr(cfg.wifiSSID);
+    webServer.sendContent(F("\" autocomplete=off autocapitalize=none>"
+        "<label for=wifiPass>Wi-Fi password</label>"
+        "<input id=wifiPass name=wifiPass type=text maxlength=63 placeholder=\"Network password\" value=\""));
+    sendHtmlAttr(cfg.wifiPass);
+    webServer.sendContent(F("\" autocomplete=off autocapitalize=none>"
+        "<p class=hint>Clear the Wi-Fi name and save to reopen setup hotspot "
         "(GPS-SpeedMonitor / speed1234). Or hold MENU 3 seconds on the device. "
-        "Or open <a href='/wifi'>Wi-Fi Setup</a>.</p></div>"));
+        "Or open <a href=/wifi>Wi-Fi Setup</a>.</p></div>"));
 
     // Server
     webServer.sendContent(F(
