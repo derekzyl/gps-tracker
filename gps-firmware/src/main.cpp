@@ -41,6 +41,8 @@
 #include <TinyGPS++.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
+#include <esp_sleep.h>
+#include <qrcode.h>
 
 // ═══════════════════════════════════════════════════════════
 //  PIN DEFINITIONS
@@ -91,6 +93,10 @@
 #define GEO_SYNC_MS           300000
 #define QUEUE_SIZE            12
 #define MAX_DYN_ZONES         16
+#define PARKED_SPEED_KPH      2.0f
+#define PARKED_TIMEOUT_MS     300000UL   // 5 min stationary → deep sleep
+#define SLEEP_DURATION_US     120000000ULL // wake every 2 min to check
+#define WAKE_BTN_PIN          BTN_MENU
 
 #define AP_SSID               "GPS-SpeedMonitor"
 #define AP_PASS               "speed1234"
@@ -161,6 +167,14 @@ struct SystemState {
 
     unsigned long totalViolations = 0;
     float   maxSpeedSeen   = 0.0f;
+
+    unsigned long lastHeartbeatMs = 0;
+    unsigned long lastGeoSyncMs   = 0;
+    int     pendingQueue   = 0;
+    int     dynZoneCount   = 0;
+    uint32_t geofenceVersion = 0;
+    unsigned long parkedSinceMs = 0;
+    bool    sleepEnabled   = true;
 } state;
 
 // ── NVS-backed config ────────────────────────────────────────
@@ -170,6 +184,7 @@ struct Config {
     char   wifiPass[64]       = "";
     char   serverURL[128]     = "http://visiting-carmella-cybergenii-895c1fde.koyeb.app/api/violation";
     char   deviceID[32]       = "ESP32-SPEED-01";
+    char   apiKey[48]         = "";
     int    defaultSpeedLimit  = DEFAULT_SPEED_LIMIT;
     int    threshMinor        = THRESH_MINOR;
     int    threshModerate     = THRESH_MODERATE;
@@ -177,6 +192,19 @@ struct Config {
     int    numPhones          = N_DEFAULT_NUMBERS;
     char   phones[MAX_PHONE_NUMBERS][20];
 } cfg;
+
+// Dynamic geofences from server (fallback = compiled ZONES)
+struct DynZone {
+    float latMin, latMax, lonMin, lonMax, limitKph;
+    char  label[24];
+} dynZones[MAX_DYN_ZONES];
+
+// Offline store-and-forward queue
+struct QueuedPost {
+    bool  used;
+    float speed, limit, lat, lon;
+    char  tier[10];
+} postQueue[QUEUE_SIZE];
 
 // ── Violation ring buffer ────────────────────────────────────
 struct ViolationRecord {
@@ -218,6 +246,16 @@ void triggerAlert(int);
 void silenceAlert();
 bool sendSMS(const char*);
 bool postToServer(float, float, float, float, const char*);
+void enqueuePost(float, float, float, float, const char*);
+void flushPostQueue();
+bool sendHeartbeat();
+bool syncGeofences();
+void setupOTA();
+String serverBaseURL();
+void addApiHeaders(HTTPClient& http);
+void maybeEnterDeepSleep();
+void enterDeepSleep();
+void printWakeReason();
 void updateLCD(const char*, const char*);
 void logViolation(float, float, float, float, int);
 void truncate16(char* dest, const char* src);
@@ -228,6 +266,8 @@ void handleButtons();
 void sendDashboard();
 void sendSettings();
 void sendWifiSetup();
+void sendWifiScanJSON();
+void sendSetupQrHtml(const char* url);
 void sendStatusJSON();
 void sendViolationsJSON();
 void gsmSendAT(const char*, unsigned long timeout = 1000);
@@ -241,7 +281,11 @@ const char* modeLabel();
 // ═══════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
-    Serial.println(F("\n=== GPS Speed Monitor v1.2 — System Starting ==="));
+    delay(50);
+    Serial.println(F("\n=== Velocis Firmware v1.4 — System Starting ==="));
+    printWakeReason();
+
+    memset(postQueue, 0, sizeof(postQueue));
 
     pinMode(PIN_LED_RED,    OUTPUT);
     pinMode(PIN_LED_YELLOW, OUTPUT);
@@ -255,7 +299,7 @@ void setup() {
     Wire.begin(LCD_SDA, LCD_SCL);
     lcd.init();
     lcd.backlight();
-    updateLCD("GPS Speed v1.2", "Starting...");
+    updateLCD("Velocis v1.4", "Starting...");
 
     loadConfig();
 
@@ -272,6 +316,11 @@ void setup() {
     Serial.printf("[GSM]  Ready: %s\n", state.gsmReady ? "YES" : "NO");
 
     setupWebServer();
+    if (state.wifiConnected) {
+        setupOTA();
+        syncGeofences();
+        sendHeartbeat();
+    }
 
     state.lastUiMs = millis();
     renderUi(true);
@@ -297,11 +346,27 @@ void loop() {
         dnsServer.processNextRequest();
 
     webServer.handleClient();
+    if (state.wifiConnected)
+        ArduinoOTA.handle();
+
     handleButtons();
     renderUi(false);
 
     if (gps.location.isUpdated() && gps.location.isValid())
         handleGPS();
+
+    unsigned long now = millis();
+    if (state.wifiConnected && state.internetOk) {
+        if (now - state.lastHeartbeatMs >= HEARTBEAT_MS) {
+            state.lastHeartbeatMs = now;
+            sendHeartbeat();
+            flushPostQueue();
+        }
+        if (now - state.lastGeoSyncMs >= GEO_SYNC_MS) {
+            state.lastGeoSyncMs = now;
+            syncGeofences();
+        }
+    }
 
     static unsigned long lastBlink = 0;
     if (!state.gpsValid && millis() - lastBlink > 1000) {
@@ -312,9 +377,11 @@ void loop() {
     static unsigned long lastHeap = 0;
     if (millis() - lastHeap > 5000) {
         lastHeap = millis();
-        Serial.printf("[MEM]  Free heap: %u bytes\n", ESP.getFreeHeap());
+        Serial.printf("[MEM]  Free heap: %u bytes  queue=%d zones=%d\n",
+                      ESP.getFreeHeap(), state.pendingQueue, state.dynZoneCount);
     }
 
+    maybeEnterDeepSleep();
     delay(10);
 }
 
@@ -338,6 +405,15 @@ void handleGPS() {
         if (dt > 0.1f && dt < 5.0f)
             speed = haversineSpeed(state.prevLat, state.prevLon, lat, lon, dt);
     }
+    // Blend with module-reported speed when available (smoother at low speed)
+    if (gps.speed.isValid()) {
+        float gpsKph = gps.speed.kmph();
+        if (speed <= 0.5f) speed = gpsKph;
+        else speed = 0.65f * speed + 0.35f * gpsKph;
+    }
+    // Reject impossible spikes
+    if (state.currentSpeed > 1.0f && speed > state.currentSpeed * 2.5f && speed > 40.0f)
+        speed = state.currentSpeed;
 
     state.currentSpeed = speed;
     if (speed > state.maxSpeedSeen) state.maxSpeedSeen = speed;
@@ -382,6 +458,11 @@ const SpeedZone ZONES[] = {
 const int N_ZONES = sizeof(ZONES) / sizeof(SpeedZone);
 
 float getSpeedLimit(float lat, float lon) {
+    for (int i = 0; i < state.dynZoneCount; i++)
+        if (lat >= dynZones[i].latMin && lat <= dynZones[i].latMax &&
+            lon >= dynZones[i].lonMin && lon <= dynZones[i].lonMax)
+            return dynZones[i].limitKph;
+
     for (int i = 0; i < N_ZONES; i++)
         if (lat >= ZONES[i].latMin && lat <= ZONES[i].latMax &&
             lon >= ZONES[i].lonMin && lon <= ZONES[i].lonMax)
@@ -424,11 +505,19 @@ void processViolation(float speed, float limit, float lat, float lon) {
                 tierStr, cfg.deviceID, speed, limit, excess, lat, lon);
             if (sendSMS(msg)) state.lastSmsMs = now;
         }
-        if (now - state.lastPostMs > 5000)
-            if (postToServer(speed, limit, lat, lon, tierStr)) state.lastPostMs = millis();
+        if (now - state.lastPostMs > 5000) {
+            if (!postToServer(speed, limit, lat, lon, tierStr))
+                enqueuePost(speed, limit, lat, lon, tierStr);
+            else
+                state.lastPostMs = millis();
+        }
     } else if (tier == 2) {
-        if (now - state.lastPostMs > 5000)
-            if (postToServer(speed, limit, lat, lon, tierStr)) state.lastPostMs = millis();
+        if (now - state.lastPostMs > 5000) {
+            if (!postToServer(speed, limit, lat, lon, tierStr))
+                enqueuePost(speed, limit, lat, lon, tierStr);
+            else
+                state.lastPostMs = millis();
+        }
     }
 }
 
@@ -581,17 +670,58 @@ bool sendSMS(const char* message) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  HTTP POST — FIX 1: plain HTTP, no TLS heap cost
+//  HTTP helpers + store-and-forward + heartbeat + geofences
 // ═══════════════════════════════════════════════════════════
+String serverBaseURL() {
+    String u = cfg.serverURL;
+    int api = u.indexOf("/api/");
+    if (api > 0) return u.substring(0, api);
+    int slash = u.lastIndexOf('/');
+    if (slash > 8) return u.substring(0, slash);
+    return u;
+}
+
+void addApiHeaders(HTTPClient& http) {
+    http.addHeader("Content-Type", "application/json");
+    if (strlen(cfg.apiKey) > 0)
+        http.addHeader("X-API-Key", cfg.apiKey);
+}
+
+void enqueuePost(float speed, float limit, float lat, float lon, const char* tier) {
+    for (int i = 0; i < QUEUE_SIZE; i++) {
+        if (!postQueue[i].used) {
+            postQueue[i].used = true;
+            postQueue[i].speed = speed;
+            postQueue[i].limit = limit;
+            postQueue[i].lat = lat;
+            postQueue[i].lon = lon;
+            strncpy(postQueue[i].tier, tier ? tier : "MINOR", 9);
+            postQueue[i].tier[9] = '\0';
+            state.pendingQueue++;
+            Serial.printf("[QUEUE] Stored offline post (%d pending)\n", state.pendingQueue);
+            return;
+        }
+    }
+    Serial.println(F("[QUEUE] Full — dropping oldest slot"));
+    // overwrite slot 0
+    postQueue[0].speed = speed;
+    postQueue[0].limit = limit;
+    postQueue[0].lat = lat;
+    postQueue[0].lon = lon;
+    strncpy(postQueue[0].tier, tier ? tier : "MINOR", 9);
+    postQueue[0].tier[9] = '\0';
+    postQueue[0].used = true;
+}
+
 bool postToServer(float speed, float limit, float lat, float lon, const char* tier) {
     if (!state.wifiConnected || strlen(cfg.serverURL) < 10) return false;
 
     HTTPClient http;
-    http.begin(cfg.serverURL);          // HTTP only — no WiFiClientSecure needed
-    http.addHeader("Content-Type", "application/json");
+    http.begin(cfg.serverURL);
+    addApiHeaders(http);
     http.setTimeout(SERVER_TIMEOUT_MS);
 
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<320> doc;
     doc["device"]    = cfg.deviceID;
     doc["speed"]     = speed;
     doc["limit"]     = limit;
@@ -600,9 +730,10 @@ bool postToServer(float speed, float limit, float lat, float lon, const char* ti
     doc["lat"]       = lat;
     doc["lon"]       = lon;
     doc["timestamp"] = millis();
+    if (strlen(cfg.apiKey) > 0) doc["api_key"] = cfg.apiKey;
 
     String payload;
-    payload.reserve(200);
+    payload.reserve(240);
     serializeJson(doc, payload);
 
     int code = http.POST(payload);
@@ -614,6 +745,187 @@ bool postToServer(float speed, float limit, float lat, float lon, const char* ti
     }
     Serial.printf("[POST] Server returned HTTP %d\n", code);
     return false;
+}
+
+void flushPostQueue() {
+    if (!state.wifiConnected || !state.internetOk || state.pendingQueue <= 0) return;
+    for (int i = 0; i < QUEUE_SIZE; i++) {
+        if (!postQueue[i].used) continue;
+        if (postToServer(postQueue[i].speed, postQueue[i].limit,
+                         postQueue[i].lat, postQueue[i].lon, postQueue[i].tier)) {
+            postQueue[i].used = false;
+            if (state.pendingQueue > 0) state.pendingQueue--;
+            Serial.println(F("[QUEUE] Flushed one pending post"));
+        } else {
+            break; // stop if network failing
+        }
+        yield();
+    }
+}
+
+bool sendHeartbeat() {
+    if (!state.wifiConnected || strlen(cfg.serverURL) < 10) return false;
+
+    String url = serverBaseURL() + "/api/heartbeat";
+    HTTPClient http;
+    http.begin(url);
+    addApiHeaders(http);
+    http.setTimeout(SERVER_TIMEOUT_MS);
+
+    StaticJsonDocument<384> doc;
+    doc["device"]      = cfg.deviceID;
+    doc["speed"]       = state.currentSpeed;
+    doc["limit"]       = state.speedLimit;
+    doc["lat"]         = state.gpsValid ? state.prevLat : 0;
+    doc["lon"]         = state.gpsValid ? state.prevLon : 0;
+    doc["gps_valid"]   = state.gpsValid;
+    doc["wifi_rssi"]   = WiFi.RSSI();
+    doc["free_heap"]   = ESP.getFreeHeap();
+    doc["internet_ok"] = state.internetOk;
+    doc["queue"]       = state.pendingQueue;
+    if (strlen(cfg.apiKey) > 0) doc["api_key"] = cfg.apiKey;
+
+    String payload;
+    serializeJson(doc, payload);
+    int code = http.POST(payload);
+
+    bool ok = (code == 200 || code == 201);
+    if (ok) {
+        // Optionally refresh geofences from heartbeat response
+        String body = http.getString();
+        StaticJsonDocument<2048> resp;
+        if (!deserializeJson(resp, body) && resp["geofences"].is<JsonArray>()) {
+            JsonArray arr = resp["geofences"].as<JsonArray>();
+            int n = 0;
+            for (JsonObject z : arr) {
+                if (n >= MAX_DYN_ZONES) break;
+                dynZones[n].latMin = z["lat_min"] | 0.0f;
+                dynZones[n].latMax = z["lat_max"] | 0.0f;
+                dynZones[n].lonMin = z["lon_min"] | 0.0f;
+                dynZones[n].lonMax = z["lon_max"] | 0.0f;
+                dynZones[n].limitKph = z["limit_kph"] | (float)cfg.defaultSpeedLimit;
+                const char* name = z["name"] | "Zone";
+                strncpy(dynZones[n].label, name, 23);
+                dynZones[n].label[23] = '\0';
+                n++;
+            }
+            state.dynZoneCount = n;
+            state.geofenceVersion = resp["geofences_version"] | state.geofenceVersion;
+        }
+        Serial.printf("[HB]   OK zones=%d\n", state.dynZoneCount);
+    } else {
+        Serial.printf("[HB]   HTTP %d\n", code);
+    }
+    http.end();
+    return ok;
+}
+
+bool syncGeofences() {
+    if (!state.wifiConnected) return false;
+    String url = serverBaseURL() + "/api/geofences";
+    HTTPClient http;
+    http.begin(url);
+    addApiHeaders(http);
+    http.setTimeout(SERVER_TIMEOUT_MS);
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("[GEO]  Sync HTTP %d\n", code);
+        http.end();
+        return false;
+    }
+    String body = http.getString();
+    http.end();
+
+    StaticJsonDocument<2048> doc;
+    if (deserializeJson(doc, body)) return false;
+    JsonArray arr = doc["geofences"].as<JsonArray>();
+    if (arr.isNull()) return false;
+
+    int n = 0;
+    for (JsonObject z : arr) {
+        if (n >= MAX_DYN_ZONES) break;
+        bool active = z["active"] | true;
+        if (!active) continue;
+        dynZones[n].latMin = z["lat_min"] | 0.0f;
+        dynZones[n].latMax = z["lat_max"] | 0.0f;
+        dynZones[n].lonMin = z["lon_min"] | 0.0f;
+        dynZones[n].lonMax = z["lon_max"] | 0.0f;
+        dynZones[n].limitKph = z["limit_kph"] | (float)cfg.defaultSpeedLimit;
+        const char* name = z["name"] | "Zone";
+        strncpy(dynZones[n].label, name, 23);
+        dynZones[n].label[23] = '\0';
+        n++;
+    }
+    state.dynZoneCount = n;
+    state.geofenceVersion = doc["geofences_version"] | 0;
+    Serial.printf("[GEO]  Synced %d zones\n", n);
+    return true;
+}
+
+void setupOTA() {
+    ArduinoOTA.setHostname(cfg.deviceID);
+    ArduinoOTA.onStart([]() { updateLCD("OTA Update...", "Do not power off"); });
+    ArduinoOTA.onEnd([]() { updateLCD("OTA Done", "Rebooting..."); });
+    ArduinoOTA.onError([](ota_error_t e) {
+        Serial.printf("[OTA] Error %u\n", e);
+        updateLCD("OTA Failed", "Check serial");
+    });
+    ArduinoOTA.begin();
+    Serial.println(F("[OTA]  Ready"));
+}
+
+void printWakeReason() {
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    switch (cause) {
+        case ESP_SLEEP_WAKEUP_EXT0:  Serial.println(F("[SLEEP] Wake: MENU button")); break;
+        case ESP_SLEEP_WAKEUP_TIMER: Serial.println(F("[SLEEP] Wake: timer")); break;
+        default: Serial.println(F("[SLEEP] Wake: power-on / reset")); break;
+    }
+}
+
+void enterDeepSleep() {
+    flushPostQueue();
+    if (state.wifiConnected && state.internetOk)
+        sendHeartbeat();
+
+    updateLCD("Parked sleep", "MENU to wake");
+    Serial.printf("[SLEEP] Deep sleep %llu s (parked)\n", SLEEP_DURATION_US / 1000000ULL);
+    delay(400);
+
+    lcd.noBacklight();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
+    // MENU (GPIO18) LOW wakes — INPUT_PULLUP, wake on low
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_BTN_PIN, 0);
+    esp_deep_sleep_start();
+}
+
+void maybeEnterDeepSleep() {
+    if (!state.sleepEnabled) return;
+    if (state.mode == MODE_PROVISIONING || state.mode == MODE_CONNECTING) return;
+    if (state.pendingQueue > 0) return;          // finish uploads first
+    if (state.violationTier > 0) {               // active alert
+        state.parkedSinceMs = 0;
+        return;
+    }
+
+    unsigned long now = millis();
+    if (!state.gpsValid) {
+        // No fix yet — don't sleep during acquisition for first 3 minutes
+        if (now < 180000UL) return;
+    }
+
+    if (state.currentSpeed >= PARKED_SPEED_KPH) {
+        state.parkedSinceMs = 0;
+        return;
+    }
+
+    if (state.parkedSinceMs == 0)
+        state.parkedSinceMs = now;
+    else if (now - state.parkedSinceMs >= PARKED_TIMEOUT_MS)
+        enterDeepSleep();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -722,18 +1034,22 @@ void renderStatusScreen(UiScreen screen) {
 
 void renderProvisioningLcd() {
     char l1[17], l2[17];
-    switch (state.provPage % 3) {
+    switch (state.provPage % 4) {
         case 0:
             snprintf(l1, sizeof(l1), "WiFi Setup Mode");
-            snprintf(l2, sizeof(l2), "Join hotspot...");
+            snprintf(l2, sizeof(l2), "Scan QR on phone");
             break;
         case 1:
             snprintf(l1, sizeof(l1), "Hotspot name:");
             snprintf(l2, sizeof(l2), "%.16s", AP_SSID);
             break;
-        default:
+        case 2:
             snprintf(l1, sizeof(l1), "Pass:%s", AP_PASS);
             snprintf(l2, sizeof(l2), "%s", WiFi.softAPIP().toString().c_str());
+            break;
+        default:
+            snprintf(l1, sizeof(l1), "Open in browser");
+            snprintf(l2, sizeof(l2), "%s/wifi", WiFi.softAPIP().toString().c_str());
             break;
     }
     updateLCD(l1, l2);
@@ -870,7 +1186,8 @@ void enterProvisioning(const char* reason) {
 void startProvisioningAP() {
     WiFi.disconnect(true, true);
     delay(100);
-    WiFi.mode(WIFI_AP);
+    // AP+STA so nearby SSIDs can be scanned during setup
+    WiFi.mode(WIFI_AP_STA);
     bool ok = WiFi.softAP(AP_SSID, AP_PASS);
     state.apActive = ok;
     state.wifiConnected = false;
@@ -962,6 +1279,12 @@ void connectWiFi() {
             state.mode = MODE_LOCAL;
             updateLCD("WiFi: no net", cfg.wifiSSID);
         }
+        setupOTA();
+        if (state.internetOk) {
+            syncGeofences();
+            sendHeartbeat();
+            flushPostQueue();
+        }
         delay(800);
         return;
     }
@@ -992,6 +1315,12 @@ void applyWiFiCredentials(const char* ssid, const char* pass) {
             state.mode = MODE_ONLINE;
         else
             state.mode = MODE_LOCAL;
+        setupOTA();
+        if (state.internetOk) {
+            syncGeofences();
+            sendHeartbeat();
+            flushPostQueue();
+        }
         state.uiScreen = UI_WIFI;
         state.uiPaused = true;
         state.uiPauseUntil = millis() + UI_PAUSE_MS;
@@ -1027,6 +1356,12 @@ void loadConfig() {
         strncpy(cfg.serverURL, prefs.getString("serverURL").c_str(), 127);
     if (prefs.isKey("deviceID"))
         strncpy(cfg.deviceID,  prefs.getString("deviceID").c_str(),  31);
+    if (prefs.isKey("apiKey")) {
+        strncpy(cfg.apiKey, prefs.getString("apiKey").c_str(), 47);
+        cfg.apiKey[47] = '\0';
+    }
+    if (prefs.isKey("sleepEn"))
+        state.sleepEnabled = prefs.getBool("sleepEn");
 
     if (prefs.isKey("defLimit"))    cfg.defaultSpeedLimit = prefs.getInt("defLimit");
     if (prefs.isKey("thrMinor"))    cfg.threshMinor       = prefs.getInt("thrMinor");
@@ -1061,6 +1396,8 @@ void saveConfig() {
     prefs.putBool("wifiCfg",     state.wifiConfigured);
     prefs.putString("serverURL", cfg.serverURL);
     prefs.putString("deviceID",  cfg.deviceID);
+    prefs.putString("apiKey",    cfg.apiKey);
+    prefs.putBool("sleepEn",     state.sleepEnabled);
     prefs.putInt("defLimit",     cfg.defaultSpeedLimit);
     prefs.putInt("thrMinor",     cfg.threshMinor);
     prefs.putInt("thrModerate",  cfg.threshModerate);
@@ -1213,7 +1550,16 @@ void sendWifiSetup() {
         "<div class=onb>"
         "<div class='fs hi'>"
         "<h2>Enter Wi-Fi name &amp; password</h2>"
-        "<p class=lead>Type your home/office network below, then tap Save &amp; Connect.</p>"
+        "<p class=lead>Type your home/office network below, then tap Save &amp; Connect.</p>"));
+
+    {
+        char url[48];
+        IPAddress ip = state.apActive ? WiFi.softAPIP() : currentDeviceIP();
+        snprintf(url, sizeof(url), "http://%s/wifi", ip.toString().c_str());
+        sendSetupQrHtml(url);
+    }
+
+    webServer.sendContent(F(
         "<form method=POST action=/wifi>"
         "<label for=wifiSSID>Wi-Fi name (SSID)</label>"
         "<input id=wifiSSID name=wifiSSID type=text required maxlength=63 "
@@ -1227,7 +1573,11 @@ void sendWifiSetup() {
     webServer.sendContent(F("\" autocomplete=off autocapitalize=none spellcheck=false>"
         "<p class=hint>Not the hotspot password. Leave blank only for open networks.</p>"
         "<button class=\"btn bp\" type=submit>Save &amp; Connect</button>"
-        "</form></div>"));
+        "</form>"
+        "<p class=lead style=\"margin-top:12px\">Nearby networks</p>"
+        "<div id=scanBox class=hint>Scanning…</div>"
+        "<button type=button class=\"btn bg\" onclick=doScan()>Refresh scan</button>"
+        "</div>"));
 
     if (webServer.hasArg("err"))
         webServer.sendContent(F("<div class=merr>Could not join that network. Check name/password and try again.</div>"));
@@ -1241,7 +1591,7 @@ void sendWifiSetup() {
             "<div class=ipbox>http://%s/wifi</div>"
             "<ol class=steps>"
             "<li>Join phone to <b>%s</b> (pass <b>%s</b>)</li>"
-            "<li>Fill the fields above with your router Wi-Fi</li>"
+            "<li>Pick a network above or type your router Wi-Fi</li>"
             "<li>Tap Save &amp; Connect</li>"
             "</ol>"
             "<p class=hint style=\"text-align:center\"><a href=/settings>All settings</a></p>"
@@ -1250,8 +1600,71 @@ void sendWifiSetup() {
         webServer.sendContent(buf);
     }
 
+    webServer.sendContent(F(
+        "<script>"
+        "function pick(s){document.getElementById('wifiSSID').value=s;"
+        "document.getElementById('wifiPass').focus();}"
+        "function doScan(){var b=document.getElementById('scanBox');"
+        "b.textContent='Scanning…';"
+        "fetch('/api/scan').then(r=>r.json()).then(d=>{"
+        "if(!d.networks||!d.networks.length){b.textContent='No networks found';return;}"
+        "b.innerHTML=d.networks.map(n=>"
+        "'<button type=button class=\"btn bg\" style=\"display:block;width:100%;margin:4px 0;text-align:left\" "
+        "onclick=\"pick(\\''+n.ssid.replace(/'/g,\"\\\\'\")+'\")\">'+n.ssid+' ('+n.rssi+' dBm)</button>'"
+        ").join('');"
+        "}).catch(()=>{b.textContent='Scan failed';});}"
+        "doScan();"
+        "</script>"));
+
     htmlFoot();
     webServer.sendContent("");
+}
+
+void sendWifiScanJSON() {
+    int n = WiFi.scanNetworks(false, true);
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.sendHeader("Access-Control-Allow-Origin", "*");
+    webServer.send(200, "application/json", "");
+    webServer.sendContent(F("{\"ok\":true,\"networks\":["));
+    int sent = 0;
+    for (int i = 0; i < n && sent < 20; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) continue;
+        char buf[160];
+        ssid.replace("\\", "\\\\");
+        ssid.replace("\"", "\\\"");
+        snprintf(buf, sizeof(buf), "%s{\"ssid\":\"%s\",\"rssi\":%d,\"enc\":%d}",
+                 sent ? "," : "", ssid.c_str(), WiFi.RSSI(i), (int)WiFi.encryptionType(i));
+        webServer.sendContent(buf);
+        sent++;
+    }
+    webServer.sendContent(F("]}"));
+    webServer.sendContent("");
+    WiFi.scanDelete();
+}
+
+void sendSetupQrHtml(const char* url) {
+    QRCode qrcode;
+    uint8_t qrBuf[qrcode_getBufferSize(3)];
+    qrcode_initText(&qrcode, qrBuf, 3, ECC_LOW, url);
+    webServer.sendContent(F(
+        "<div style=\"text-align:center;margin:12px 0 16px\">"
+        "<div class=eyebrow>Scan with phone camera</div>"
+        "<table cellspacing=0 cellpadding=0 style=\"margin:10px auto;border-collapse:collapse;"
+        "background:#fff;padding:8px;border:1px solid #d5dee8;border-radius:8px\">"));
+    for (uint8_t y = 0; y < qrcode.size; y++) {
+        webServer.sendContent(F("<tr>"));
+        for (uint8_t x = 0; x < qrcode.size; x++) {
+            if (qrcode_getModule(&qrcode, x, y))
+                webServer.sendContent(F("<td style=\"width:5px;height:5px;background:#0b1f33\"></td>"));
+            else
+                webServer.sendContent(F("<td style=\"width:5px;height:5px;background:#fff\"></td>"));
+        }
+        webServer.sendContent(F("</tr>"));
+    }
+    webServer.sendContent(F("</table><p class=hint mono>"));
+    webServer.sendContent(url);
+    webServer.sendContent(F("</p></div>"));
 }
 
 // ── Dashboard ─────────────────────────────────────────────────
@@ -1420,7 +1833,13 @@ void sendSettings() {
     webServer.sendContent(F("'><p class='hint'>Use http:// — HTTPS needs too much RAM on ESP32</p>"
         "<label>Device ID</label><input name='deviceID' value='"));
     webServer.sendContent(cfg.deviceID);
-    webServer.sendContent(F("'></div>"));
+    webServer.sendContent(F("'>"
+        "<label>API key (optional)</label><input name='apiKey' value='"));
+    webServer.sendContent(cfg.apiKey);
+    webServer.sendContent(F("'><p class=hint>Must match the key on the Velocis server device registry when REQUIRE_AUTH=true.</p>"
+        "<label><input name=sleepEn type=checkbox value=1"));
+    if (state.sleepEnabled) webServer.sendContent(F(" checked"));
+    webServer.sendContent(F("> Enable parked deep-sleep (5 min idle → sleep, MENU wakes)</label></div>"));
 
     // Thresholds
     {
@@ -1492,6 +1911,9 @@ void sendStatusJSON() {
     doc["max_speed"]        = state.maxSpeedSeen;
     doc["uptime_ms"]        = millis();
     doc["free_heap"]        = ESP.getFreeHeap();
+    doc["queue_pending"]    = state.pendingQueue;
+    doc["dyn_zones"]        = state.dynZoneCount;
+    doc["geofence_version"] = state.geofenceVersion;
     if (gps.satellites.isValid()) doc["satellites"] = gps.satellites.value();
     if (gps.hdop.isValid())       doc["hdop"]       = gps.hdop.hdop();
     String out;
@@ -1569,6 +1991,11 @@ void setupWebServer() {
             strncpy(cfg.serverURL, webServer.arg("serverURL").c_str(), 127);
         if (webServer.hasArg("deviceID"))
             strncpy(cfg.deviceID, webServer.arg("deviceID").c_str(), 31);
+        if (webServer.hasArg("apiKey")) {
+            strncpy(cfg.apiKey, webServer.arg("apiKey").c_str(), 47);
+            cfg.apiKey[47] = '\0';
+        }
+        state.sleepEnabled = webServer.hasArg("sleepEn");
         if (webServer.hasArg("defLimit"))
             cfg.defaultSpeedLimit = webServer.arg("defLimit").toInt();
         if (webServer.hasArg("thrMinor"))
@@ -1621,6 +2048,7 @@ void setupWebServer() {
 
     webServer.on("/api/status",     HTTP_GET, sendStatusJSON);
     webServer.on("/api/violations", HTTP_GET, sendViolationsJSON);
+    webServer.on("/api/scan",       HTTP_GET, sendWifiScanJSON);
 
     webServer.on("/test-sms", HTTP_GET, []() {
         char msg[160];
