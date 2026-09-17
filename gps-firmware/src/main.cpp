@@ -119,9 +119,11 @@ enum DeviceMode : uint8_t {
 };
 
 const char* DEFAULT_NUMBERS[] = {
-    "+2347059011222",
     "+2348135993811",
     "+2348056322139"
+    "+2347059011222",
+
+ 
 };
 // Auto-count: stays correct when you add/remove entries above
 constexpr int N_DEFAULT_NUMBERS =
@@ -175,6 +177,7 @@ struct SystemState {
     uint32_t geofenceVersion = 0;
     unsigned long parkedSinceMs = 0;
     bool    sleepEnabled   = true;
+    unsigned long buzzerMuteUntilMs = 0;
 } state;
 
 // ── NVS-backed config ────────────────────────────────────────
@@ -283,6 +286,25 @@ const char* modeLabel();
 // ═══════════════════════════════════════════════════════════
 //  SETUP
 // ═══════════════════════════════════════════════════════════
+// ── Custom LCD 5x8 Glyphs ────────────────────────────────────
+const uint8_t GLYPH_SAT[8]   = { 0b00100, 0b01110, 0b11111, 0b00100, 0b01010, 0b10001, 0b00000, 0b00000 };
+const uint8_t GLYPH_WIFI[8]  = { 0b00000, 0b01110, 0b10001, 0b00100, 0b01010, 0b00000, 0b00100, 0b00000 };
+const uint8_t GLYPH_GSM[8]   = { 0b10001, 0b01010, 0b00100, 0b00100, 0b01110, 0b00100, 0b00100, 0b00100 };
+const uint8_t GLYPH_ALERT[8] = { 0b00100, 0b01110, 0b01110, 0b01110, 0b00100, 0b00000, 0b00100, 0b00000 };
+const uint8_t GLYPH_FULL[8]  = { 0b11111, 0b11111, 0b11111, 0b11111, 0b11111, 0b11111, 0b11111, 0b11111 };
+const uint8_t GLYPH_HALF[8]  = { 0b11100, 0b11100, 0b11100, 0b11100, 0b11100, 0b11100, 0b11100, 0b11100 };
+const uint8_t GLYPH_CHECK[8] = { 0b00000, 0b00001, 0b00011, 0b10110, 0b11100, 0b01000, 0b00000, 0b00000 };
+
+void initLcdGlyphs() {
+    lcd.createChar(0, (uint8_t*)GLYPH_SAT);
+    lcd.createChar(1, (uint8_t*)GLYPH_WIFI);
+    lcd.createChar(2, (uint8_t*)GLYPH_GSM);
+    lcd.createChar(3, (uint8_t*)GLYPH_ALERT);
+    lcd.createChar(4, (uint8_t*)GLYPH_FULL);
+    lcd.createChar(5, (uint8_t*)GLYPH_HALF);
+    lcd.createChar(6, (uint8_t*)GLYPH_CHECK);
+}
+
 void setup() {
     Serial.begin(115200);
     delay(50);
@@ -303,6 +325,7 @@ void setup() {
     Wire.begin(LCD_SDA, LCD_SCL);
     lcd.init();
     lcd.backlight();
+    initLcdGlyphs();
     updateLCD("Velocis v1.4", "Starting...");
 
     loadConfig();
@@ -530,6 +553,7 @@ void processViolation(float speed, float limit, float lat, float lon) {
 // ═══════════════════════════════════════════════════════════
 void triggerAlert(int tier) {
     unsigned long now = millis();
+    bool buzzerMuted = (now < state.buzzerMuteUntilMs);
     switch (tier) {
         case 0:
             digitalWrite(PIN_LED_GREEN,  HIGH);
@@ -546,13 +570,13 @@ void triggerAlert(int tier) {
             digitalWrite(PIN_LED_GREEN,  LOW);
             digitalWrite(PIN_LED_YELLOW, HIGH);
             if (now - lastBlinkMs > 300) { blinkState = !blinkState; lastBlinkMs = now; }
-            digitalWrite(PIN_LED_RED, blinkState);
+            digitalWrite(PIN_LED_RED, buzzerMuted ? LOW : blinkState);
             break;
         case 3:
             digitalWrite(PIN_LED_GREEN,  LOW);
             digitalWrite(PIN_LED_YELLOW, LOW);
             if (now - lastBlinkMs > 200) { blinkState = !blinkState; lastBlinkMs = now; }
-            digitalWrite(PIN_LED_RED, blinkState);   // buzzer shares pin 27
+            digitalWrite(PIN_LED_RED, buzzerMuted ? LOW : blinkState);   // buzzer shares pin 27
             break;
     }
 }
@@ -1024,57 +1048,70 @@ const char* modeLabel() {
 
 void renderStatusScreen(UiScreen screen) {
     char l1[17], l2[17];
+    memset(l1, ' ', 16); l1[16] = '\0';
+    memset(l2, ' ', 16); l2[16] = '\0';
 
     switch (screen) {
         case UI_SPEED: {
-            snprintf(l1, sizeof(l1), "Spd:%3.0f Lim:%3.0f",
-                     state.currentSpeed, state.speedLimit);
+            if (state.gpsValid) {
+                snprintf(l1, sizeof(l1), "\x00 %3.0fkm/h L:%-3.0f",
+                         state.currentSpeed, state.speedLimit);
+            } else {
+                snprintf(l1, sizeof(l1), "\x00 Acquiring GPS");
+            }
+
             float excess = state.currentSpeed - state.speedLimit;
-            if (!state.gpsValid)
-                snprintf(l2, sizeof(l2), "Acquiring GPS..");
-            else if (excess > 0)
-                snprintf(l2, sizeof(l2), "OVER +%.0fkm/h!", excess);
-            else
-                snprintf(l2, sizeof(l2), "SAFE            ");
+            if (!state.gpsValid) {
+                snprintf(l2, sizeof(l2), "Searching fix...");
+            } else if (excess > 0) {
+                snprintf(l2, sizeof(l2), "\x03 OVER +%2.0fkm/h!", excess);
+            } else {
+                int barCount = 0;
+                if (state.speedLimit > 0) {
+                    barCount = (int)((state.currentSpeed / state.speedLimit) * 8.0f);
+                    if (barCount > 8) barCount = 8;
+                    if (barCount < 0) barCount = 0;
+                }
+                char bar[9];
+                for (int b = 0; b < 8; b++) {
+                    bar[b] = (b < barCount) ? '\x04' : '-';
+                }
+                bar[8] = '\0';
+                snprintf(l2, sizeof(l2), "%s \x06 SAFE", bar);
+            }
             break;
         }
         case UI_WIFI: {
             if (state.wifiConnected) {
-                char ssid[17];
+                char ssid[12];
                 truncate16(ssid, cfg.wifiSSID);
-                snprintf(l1, sizeof(l1), "WiFi connected");
-                if (state.internetOk)
-                    snprintf(l2, sizeof(l2), "to:%.13s", ssid);
-                else
-                    snprintf(l2, sizeof(l2), "No internet");
+                snprintf(l1, sizeof(l1), "\x01 WiFi:%.9s", ssid);
+                snprintf(l2, sizeof(l2), "%s %s",
+                         WiFi.localIP().toString().c_str(),
+                         state.internetOk ? "\x06" : "noNet");
             } else if (state.apActive) {
-                snprintf(l1, sizeof(l1), "AP Setup Mode");
-                snprintf(l2, sizeof(l2), "%s",
-                         WiFi.softAPIP().toString().c_str());
+                snprintf(l1, sizeof(l1), "\x01 Setup AP Mode");
+                snprintf(l2, sizeof(l2), "%s", WiFi.softAPIP().toString().c_str());
             } else {
-                snprintf(l1, sizeof(l1), "WiFi: Offline");
+                snprintf(l1, sizeof(l1), "\x01 WiFi: Offline");
                 snprintf(l2, sizeof(l2), "Hold MENU setup");
             }
             break;
         }
         case UI_GPS: {
-            snprintf(l1, sizeof(l1), "Sats:%d HDOP:%.1f",
-                gps.satellites.isValid() ? (int)gps.satellites.value() : 0,
-                gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f);
-            snprintf(l2, sizeof(l2), "Fix:%s",
-                     state.gpsValid ? "ACTIVE" : "SEARCHING");
+            int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+            float hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
+            snprintf(l1, sizeof(l1), "\x00 Sats:%-2d HDOP:%.1f", sats, hdop);
+            snprintf(l2, sizeof(l2), "Fix:%s %4.1fkm",
+                     state.gpsValid ? "\x06 3D" : "NO", state.currentSpeed);
             break;
         }
         case UI_STATS:
         default: {
-            if (state.wifiConnected)
-                snprintf(l1, sizeof(l1), "%s", WiFi.localIP().toString().c_str());
-            else if (state.apActive)
-                snprintf(l1, sizeof(l1), "%s", WiFi.softAPIP().toString().c_str());
-            else
-                snprintf(l1, sizeof(l1), "Viols:%lu", state.totalViolations);
-            snprintf(l2, sizeof(l2), "Max:%.0f GSM:%s",
-                     state.maxSpeedSeen, state.gsmReady ? "OK" : "--");
+            snprintf(l1, sizeof(l1), "Max:%-3.0f Viol:%-3lu",
+                     state.maxSpeedSeen, state.totalViolations);
+            snprintf(l2, sizeof(l2), "\x02 GSM:%s Q:%d",
+                     state.gsmReady ? "\x06OK" : "--", state.pendingQueue);
             break;
         }
     }
@@ -1171,7 +1208,14 @@ void handleButtons() {
     if (!menuDown && menuWasDown) {
         menuWasDown = false;
         if (!menuLongDone && now - menuDownAt < BTN_LONG_MS) {
-            if (state.mode == MODE_PROVISIONING) {
+            if (state.violationTier > 0) {
+                state.buzzerMuteUntilMs = now + 60000;
+                silenceAlert();
+                updateLCD("Alert Silenced", "Buzzer Muted 60s");
+                state.uiPaused = true;
+                state.uiPauseUntil = now + 2500;
+                state.lastUiMs = now;
+            } else if (state.mode == MODE_PROVISIONING) {
                 state.provPage++;
                 state.lastUiMs = 0;
                 renderUi(true);
@@ -1475,7 +1519,7 @@ static const char PAGE_CSS[] PROGMEM = R"CSS(
 --sh:0 10px 32px rgba(11,31,51,.08);--r:14px}
 *{box-sizing:border-box}
 body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--ink);min-height:100vh}
-.wrap{max-width:960px;margin:0 auto;padding:20px 16px 40px}
+.wrap{max-width:1320px;width:100%;margin:0 auto;padding:24px 20px 48px;box-sizing:border-box}
 .top{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 .brand{display:flex;align-items:center;gap:12px}
 .logo{width:42px;height:42px;border-radius:11px;background:#0b1f33;color:#9ef0e2;display:grid;place-items:center;font:600 .85rem monospace}
@@ -1488,22 +1532,39 @@ body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;backgrou
 .pill{display:inline-flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:7px 12px;font-size:.75rem;color:var(--soft)}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 .dok{background:var(--teal)}.derr{background:var(--rose)}.dwrn{background:var(--amber)}
-.hero{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:20px 22px;box-shadow:var(--sh);margin-bottom:16px}
+
+/* Dashboard Top Grid */
+.dash-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:16px;margin-bottom:16px;width:100%}
+.hero{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:20px 22px;box-shadow:var(--sh);margin-bottom:14px;width:100%}
 .eyebrow{font:500 .68rem monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--mut);margin-bottom:8px}
-.hero h2{font-size:1.35rem;margin:0}.hero h2.ok{color:var(--td)}.hero h2.bad{color:var(--rose)}
+.hero h2{font-size:1.35rem;margin:0;transition:color .3s ease}.hero h2.ok{color:var(--td)}.hero h2.bad{color:var(--rose)}
 .hero .sub{color:var(--soft);font-size:.9rem;margin-top:6px;line-height:1.45}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
 .chip{font:500 .7rem monospace;background:#eef5f3;color:var(--td);border:1px solid #cce8e2;border-radius:8px;padding:5px 9px}
 .chip.warn{background:#fff4e5;color:#9a5b05;border-color:#f5d7a6}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;box-shadow:var(--sh)}
+.chip.err{background:#fde8ec;color:var(--rose);border-color:#f5c2cd}
+
+.gauge-card{text-align:center;padding:18px 16px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);width:100%}
+.gauge-box{position:relative;width:220px;height:130px;margin:8px auto}
+.gauge-svg{width:100%;height:100%}
+.gauge-bg{fill:none;stroke:#e2e8f0;stroke-width:14;stroke-linecap:round}
+.gauge-val{fill:none;stroke:var(--teal);stroke-width:14;stroke-linecap:round;stroke-dasharray:283;stroke-dashoffset:283;transition:all .4s cubic-bezier(0.4,0,0.2,1)}
+.gauge-center{position:absolute;bottom:6px;left:0;right:0}
+.gauge-val-text{font:700 2.4rem monospace;line-height:1}
+.gauge-unit{font-size:.7rem;color:var(--mut);text-transform:uppercase;letter-spacing:.08em}
+
+/* KPI Summaries Row: Full width, evenly distributed cards with zero awkward orphans */
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px;width:100%}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;box-shadow:var(--sh);width:100%;min-width:0}
 .kpi .l{font-size:.68rem;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
-.kpi .v{font:600 1.7rem monospace;margin-top:4px}.kpi .u{font-size:.7rem;color:var(--mut)}
+.kpi .v{font:600 1.65rem monospace;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kpi .u{font-size:.7rem;color:var(--mut)}
 .safe{color:var(--td)}.warn{color:var(--amber)}.danger{color:var(--rose)}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:14px;overflow:hidden}
-.phd{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
-.phd h3{font-size:.92rem;margin:0}.pbd{padding:14px 16px}
-.fs{margin:0 0 14px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh)}
+
+/* Full width panels and tables */
+.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:16px;width:100%;overflow:hidden}
+.phd{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+.phd h3{font-size:.95rem;margin:0}.pbd{padding:16px 18px}
+.fs{margin:0 0 14px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);width:100%}
 .fs.hi{border:2px solid var(--teal);background:#f3fbf9}
 .fs h2{font-size:1rem;margin:0 0 4px}.fs .lead{color:var(--mut);font-size:.8rem;margin:0 0 12px;line-height:1.4}
 label{display:block;font-size:.8rem;color:var(--soft);margin:14px 0 6px;font-weight:600}
@@ -1516,7 +1577,7 @@ input[type=checkbox]{display:inline-block;width:18px;height:18px;min-height:0;ma
 -webkit-appearance:checkbox;appearance:auto;accent-color:var(--teal)}
 label.chk{display:flex;align-items:flex-start;gap:8px;font-weight:500;line-height:1.35;margin-top:14px}
 label.chk span{flex:1}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .hint{font-size:.72rem;color:var(--mut);margin-top:6px;line-height:1.35}
 .btn{display:inline-block;padding:12px 18px;border-radius:10px;border:none;font:600 .9rem system-ui,sans-serif;cursor:pointer;text-decoration:none;margin:10px 8px 0 0}
 .bp{background:var(--teal);color:#fff}.bd{background:var(--rose);color:#fff}
@@ -1526,18 +1587,24 @@ label.chk span{flex:1}
 .rm{background:#fde8ec;color:var(--rose)}.add{background:#e6f4fc;color:#0369a1;margin-top:4px}
 .mok{padding:11px 14px;border-radius:10px;margin-bottom:12px;font-size:.84rem;background:#e8f7f3;border:1px solid #9ad9ce;color:var(--td)}
 .merr{padding:11px 14px;border-radius:10px;margin-bottom:12px;font-size:.84rem;background:#fde8ec;border:1px solid #f5c2cd;color:var(--rose)}
-.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{width:100%;border-collapse:collapse;font-size:.8rem}
-th{text-align:left;padding:9px 12px;color:var(--mut);font-size:.68rem;text-transform:uppercase;border-bottom:1px solid var(--line);background:#f7fafc}
-td{padding:10px 12px;border-bottom:1px solid #eef2f6;word-break:break-word}
-.SEVERE{color:var(--rose);font-weight:700}.MODERATE{color:var(--amber);font-weight:600}.MINOR{color:var(--sky)}
+.table-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;min-width:100%;border-collapse:collapse;font-size:.82rem}
+th{text-align:left;padding:10px 14px;color:var(--mut);font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line);background:#f7fafc}
+td{padding:12px 14px;border-bottom:1px solid #eef2f6;word-break:break-word}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#fafbfc}
+.tier-tag{display:inline-block;padding:3px 8px;border-radius:6px;font:700 .7rem monospace;letter-spacing:.04em}
+.tier-SEVERE{background:#fde8ec;color:var(--rose);border:1px solid #f5c2cd}
+.tier-MODERATE{background:#fef3c7;color:var(--amber);border:1px solid #fde68a}
+.tier-MINOR{background:#e0f2fe;color:var(--sky);border:1px solid #bae6fd}
+.tier-SAFE{background:#e8f7f3;color:var(--td);border:1px solid #9ad9ce}
 .badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:.7rem;background:#eef5f3;border:1px solid #cce8e2;color:var(--td);margin:0 4px 4px 0}
 .foot{margin-top:18px;color:var(--mut);font-size:.72rem;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
 .foot a{color:var(--td)}
 .onb{max-width:480px;margin:12px auto;width:100%}
 .ipbox{font:600 .95rem monospace;color:var(--td);background:#e8f7f3;border:1px solid #9ad9ce;border-radius:12px;padding:14px;text-align:center;margin:14px 0;word-break:break-all}
 .steps{margin:12px 0;padding-left:18px;color:var(--soft);font-size:.84rem;line-height:1.55}
-.mono{font-family:monospace}.empty{color:var(--mut);padding:18px;text-align:center}
+.mono{font-family:monospace}.empty{color:var(--mut);padding:24px;text-align:center;font-size:.88rem}
 .qr-wrap{overflow:auto;max-width:100%}
 .pinmap{font:500 .78rem monospace;background:#f7fafc;border:1px solid var(--line);border-radius:10px;padding:12px;line-height:1.55;margin-top:8px}
 .tap{cursor:pointer;transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease}
@@ -1550,24 +1617,145 @@ td{padding:10px 12px;border-bottom:1px solid #eef2f6;word-break:break-word}
 .quick{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
 .quick button{border:1px solid var(--line);background:#f7fafc;border-radius:8px;padding:7px 10px;font-size:.75rem;cursor:pointer;color:var(--soft)}
 .quick button:hover,.quick button.on{border-color:var(--teal);color:var(--td);background:#d9f3ee}
+.bench{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.hud-mode{background:#0b1320;color:#fff}
+.hud-mode .top,.hud-mode .panel,.hud-mode .foot,.hud-mode .fs,.hud-mode .dash-col.side-cockpit,.hud-mode .kpis{display:none!important}
+.hud-mode .dash-grid{grid-template-columns:1fr}
+.hud-mode .hero{background:transparent;border:none;box-shadow:none;text-align:center;padding:50px 10px}
+.hud-mode .hero h2{font-size:3.8rem;color:#00e5ff}
+@media(max-width:960px){
+.dash-grid{grid-template-columns:1fr}
+.kpis{grid-template-columns:repeat(3,1fr)}
+}
 @media(max-width:560px){
 .wrap{padding:14px 12px 32px}
 .brand h1{font-size:1.2rem}
+.kpis{grid-template-columns:repeat(2,1fr)}
 .kpi .v{font-size:1.35rem}
 .nav a{padding:7px 11px;font-size:.75rem}
 }
 </style>
 )CSS";
 
+
+static const char DASHBOARD_JS[] PROGMEM = R"JS(
+<script>
+var lastViolTotal = -1;
+function updateLive(){
+  fetch('/api/status').then(function(r){return r.json();}).then(function(d){
+    var spd = Math.round(d.speed);
+    var lim = Math.round(d.speed_limit);
+    var tier = d.violation_tier || 0;
+    var viols = d.total_violations || 0;
+    var peak = Math.round(d.max_speed || 0);
+    var sats = d.satellites || 0;
+    var gpsOk = !!d.gps_valid;
+
+    var sEl = document.getElementById('liveSpeedNum'); if(sEl) sEl.textContent = spd;
+    var arc = document.getElementById('liveArc');
+    if(arc){
+      var maxScale = Math.max(120, lim * 1.5);
+      var pct = Math.min(1, Math.max(0, spd / maxScale));
+      arc.style.strokeDashoffset = 283 - (pct * 283);
+      arc.style.stroke = (tier >= 3) ? 'var(--rose)' : (tier >= 1 ? 'var(--amber)' : 'var(--teal)');
+    }
+
+    var hTitle = document.getElementById('heroTitle');
+    if(hTitle){
+      if(!gpsOk){ hTitle.textContent = 'Acquiring GPS fix'; hTitle.className = 'bad'; }
+      else if(tier > 0){ hTitle.textContent = 'Speed limit exceeded'; hTitle.className = 'bad'; }
+      else { hTitle.textContent = 'Speed compliant'; hTitle.className = 'ok'; }
+    }
+
+    var cMode = document.getElementById('chipMode'); if(cMode) cMode.textContent = d.mode || 'NORMAL';
+    var cNet = document.getElementById('chipNet');
+    if(cNet){
+      cNet.textContent = d.wifi_connected ? (d.internet_ok ? 'Internet OK' : 'Wi-Fi · no net') : (d.ap_active ? 'Setup AP' : 'Offline');
+      cNet.className = 'chip' + (d.internet_ok ? '' : ' warn');
+    }
+    var cIp = document.getElementById('chipIp'); if(cIp) cIp.textContent = d.ip || '';
+
+    var ks = document.getElementById('kpiSpd');
+    if(ks){
+      ks.textContent = spd;
+      ks.className = 'v ' + (tier === 0 ? 'safe' : (tier <= 2 ? 'warn' : 'danger'));
+    }
+    var kl = document.getElementById('kpiLim'); if(kl) kl.textContent = lim;
+    var kt = document.getElementById('kpiTier');
+    if(kt){
+      kt.textContent = tier === 0 ? 'SAFE' : (tier === 1 ? 'MINOR' : (tier === 2 ? 'MODERATE' : 'SEVERE'));
+      kt.className = 'v ' + (tier === 0 ? 'safe' : (tier <= 2 ? 'warn' : 'danger'));
+    }
+    var kv = document.getElementById('kpiViols'); if(kv) kv.textContent = viols;
+    var kgps = document.getElementById('kpiGps'); if(kgps) kgps.textContent = gpsOk ? 'LOCK' : '…';
+    var ksats = document.getElementById('kpiSats'); if(ksats) ksats.textContent = sats + ' sats';
+    var kp = document.getElementById('kpiPeak'); if(kp) kp.textContent = peak;
+
+    var sysWifi = document.getElementById('sysWifiDot');
+    if(sysWifi) sysWifi.className = 'dot ' + (d.wifi_connected ? 'dok' : (d.ap_active ? 'dwrn' : 'derr'));
+    var sysGsm = document.getElementById('sysGsmDot');
+    if(sysGsm) sysGsm.className = 'dot ' + (d.gsm_ready ? 'dok' : 'derr');
+    var sysGps = document.getElementById('sysGpsDot');
+    if(sysGps) sysGps.className = 'dot ' + (gpsOk ? 'dok' : 'dwrn');
+    var sysIp = document.getElementById('sysIp'); if(sysIp) sysIp.textContent = 'IP ' + (d.ip || '0.0.0.0');
+    var sysHeap = document.getElementById('sysHeap'); if(sysHeap) sysHeap.textContent = 'Heap ' + (d.free_heap || 0) + ' B';
+
+    if(viols !== lastViolTotal){
+      lastViolTotal = viols;
+      updateViolations();
+    }
+  }).catch(function(){});
+}
+
+function updateViolations(){
+  fetch('/api/violations').then(function(r){return r.json();}).then(function(res){
+    var box = document.getElementById('violationsBox');
+    if(!box) return;
+    var list = res.violations || [];
+    if(list.length === 0){
+      box.innerHTML = '<div class="empty">No violations this session.</div>';
+      return;
+    }
+    var h = '<div class="table-wrap"><table><thead><tr>' +
+      '<th>#</th><th>Tier</th><th>Speed</th><th>Limit</th><th>Excess</th><th>Location</th>' +
+      '</tr></thead><tbody>';
+    for(var i = list.length - 1; i >= 0; i--){
+      var r = list[i];
+      var tier = r.tier || 'UNKNOWN';
+      var excess = Math.round(r.excess || (r.speed - r.limit));
+      h += '<tr><td class="mono">' + (list.length - i) + '</td>' +
+        '<td><span class="tier-tag tier-' + tier + '">' + tier + '</span></td>' +
+        '<td class="mono"><b>' + Math.round(r.speed) + '</b> <span class="u">km/h</span></td>' +
+        '<td class="mono">' + Math.round(r.limit) + '</td>' +
+        '<td class="mono" style="color:var(--rose)">+' + excess + '</td>' +
+        '<td class="mono" style="font-size:.75rem">' + (r.lat ? r.lat.toFixed(4) + ', ' + r.lon.toFixed(4) : 'No GPS') + '</td></tr>';
+    }
+    h += '</tbody></table></div>';
+    box.innerHTML = h;
+  }).catch(function(){});
+}
+
+setInterval(updateLive, 1000);
+updateLive();
+updateViolations();
+
+function muteBuzzer(){
+  fetch('/api/mute',{method:'POST'}).then(function(r){return r.json();}).then(function(){alert('Buzzer muted for 60s');}).catch(function(){});
+}
+function toggleHUD(){
+  document.body.classList.toggle('hud-mode');
+}
+</script>
+)JS";
+
 static void htmlHead(const char* title, bool autoRefresh = false) {
+    (void)autoRefresh; // Never refresh full page - dynamic values refresh in-place
     webServer.sendContent(F("<!DOCTYPE html><html lang=en><head>"
         "<meta charset=UTF-8>"
-        "<meta name=viewport content=\"width=device-width,initial-scale=1\">"));
-    if (autoRefresh) webServer.sendContent(F("<meta http-equiv=refresh content=4>"));
-    webServer.sendContent(F("<title>"));
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>"));
     webServer.sendContent(title);
     webServer.sendContent(F("</title>"));
-    // FPSTR: send PROGMEM CSS correctly (plain sendContent can truncate/mangle)
     webServer.sendContent_P(PAGE_CSS);
     webServer.sendContent(F("</head><body><div class=wrap>"));
 }
@@ -1647,10 +1835,11 @@ void sendWifiSetup() {
     sendHtmlAttr(cfg.wifiSSID);
     webServer.sendContent(F("\" autocomplete=off autocapitalize=none spellcheck=false>"
         "<label for=wifiPass>Wi-Fi password</label>"
-        "<input id=wifiPass name=wifiPass type=text maxlength=63 "
+        "<input id=wifiPass name=wifiPass type=password maxlength=63 "
         "placeholder=\"Your network password\" value=\""));
     sendHtmlAttr(cfg.wifiPass);
     webServer.sendContent(F("\" autocomplete=off autocapitalize=none spellcheck=false>"
+        "<label class=chk><input type=checkbox onchange=\"document.getElementById('wifiPass').type=this.checked?'text':'password'\"> <span>Show password</span></label>"
         "<p class=hint>Not the hotspot password. Leave blank only for open networks.</p>"
         "<button class=\"btn bp\" type=submit>Save &amp; Connect</button>"
         "</form>"
@@ -1688,10 +1877,11 @@ void sendWifiSetup() {
         "b.textContent='Scanning…';"
         "fetch('/api/scan').then(r=>r.json()).then(d=>{"
         "if(!d.networks||!d.networks.length){b.textContent='No networks found';return;}"
-        "b.innerHTML=d.networks.map(n=>"
-        "'<button type=button class=\"btn bg\" style=\"display:block;width:100%;margin:4px 0;text-align:left\" "
-        "onclick=\"pick(\\''+n.ssid.replace(/'/g,\"\\\\'\")+'\")\">'+n.ssid+' ('+n.rssi+' dBm)</button>'"
-        ").join('');"
+        "b.innerHTML=d.networks.map(n=>{"
+        "var b=n.rssi>-60?'●●●●':(n.rssi>-70?'●●●○':(n.rssi>-80?'●●○○':'●○○○'));"
+        "return '<button type=button class=\"btn bg\" style=\"display:flex;justify-content:space-between;width:100%;margin:4px 0;text-align:left\" '+"
+        "'onclick=\"pick(\\''+n.ssid.replace(/'/g,\"\\\\'\")+'\")\"><span>'+n.ssid+'</span><span style=\"color:#0f9d8a\">'+b+' ('+n.rssi+' dBm)</span></button>';"
+        "}).join('');"
         "}).catch(()=>{b.textContent='Scan failed';});}"
         "doScan();"
         "</script>"));
@@ -1756,8 +1946,10 @@ void sendDashboard() {
     webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
     webServer.send(200, F("text/html"), "");
 
-    htmlHead("Velocis — Live", true);
+    htmlHead("Velocis — Live", false);
     htmlTop("live");
+
+    webServer.sendContent(F("<div class=dash-grid><div class='dash-col main-cockpit'>"));
 
     // Status hero
     {
@@ -1765,19 +1957,19 @@ void sendDashboard() {
         const char* title = !state.gpsValid ? "Acquiring GPS fix"
                           : alert ? "Speed limit exceeded"
                           : "Speed compliant";
-        webServer.sendContent(F("<div class='hero'><div class='eyebrow'>Live monitor</div><h2 class='"));
+        webServer.sendContent(F("<div class='hero'><div class='eyebrow'>Live monitor</div><h2 id='heroTitle' class='"));
         webServer.sendContent(alert ? "bad" : "ok");
         webServer.sendContent(F("'>"));
         webServer.sendContent(title);
-        webServer.sendContent(F("</h2><p class='sub'>"));
+        webServer.sendContent(F("</h2><p class='sub' id='heroSub'>"));
         webServer.sendContent(cfg.deviceID);
         webServer.sendContent(F(" · session desk</p><div class='chips'>"));
 
-        char chip[120];
+        char chip[160];
         snprintf(chip, sizeof(chip),
-            "<span class='chip'>%s</span>"
-            "<span class='chip%s'>%s</span>"
-            "<span class='chip'>%s</span>",
+            "<span class='chip' id='chipMode'>%s</span>"
+            "<span class='chip%s' id='chipNet'>%s</span>"
+            "<span class='chip' id='chipIp'>%s</span>",
             modeLabel(),
             state.internetOk ? "" : " warn",
             state.wifiConnected ? (state.internetOk ? "Internet OK" : "Wi-Fi · no net")
@@ -1787,19 +1979,83 @@ void sendDashboard() {
         webServer.sendContent(F("</div></div>"));
     }
 
-    // KPI row
+    // Live Gauge Dial Card
+    webServer.sendContent(F(
+        "<div class='gauge-card'>"
+        "<div class='eyebrow'>Live Telemetry Speed</div>"
+        "<div class='gauge-box'>"
+        "<svg class='gauge-svg' viewBox='0 0 200 120'>"
+        "<path class='gauge-bg' d='M 20 105 A 80 80 0 0 1 180 105'></path>"
+        "<path class='gauge-val' id='liveArc' d='M 20 105 A 80 80 0 0 1 180 105'></path>"
+        "</svg>"
+        "<div class='gauge-center'>"
+        "<div class='gauge-val-text' id='liveSpeedNum'>0</div>"
+        "<div class='gauge-unit'>km / h</div>"
+        "</div></div>"
+        "<div class='row' style='justify-content:center;margin-top:6px'>"
+        "<button type=button class='btn bp' onclick=muteBuzzer()>Mute Buzzer (60s)</button>"
+        "<button type=button class='btn bg' onclick=toggleHUD()>HUD Mode</button>"
+        "</div></div></div>"));
+
+    // Secondary column: Diagnostics & Hardware Bench & Recipients
+    webServer.sendContent(F("<div class='dash-col side-cockpit'>"));
+
+    // System Diagnostics card
+    {
+        char buf[360];
+        snprintf(buf, sizeof(buf),
+            "<div class='panel'><div class='phd'><h3>System Diagnostics</h3>"
+            "<span class='pill'><span class='dot %s' id='sysWifiDot'></span>Wi-Fi</span></div>"
+            "<div class='pbd' style='display:flex;flex-wrap:wrap;gap:8px;align-items:center'>"
+            "<span class='pill'><span class='dot %s' id='sysGsmDot'></span>GSM</span>"
+            "<span class='pill'><span class='dot %s' id='sysGpsDot'></span>GPS</span>"
+            "<span class='pill mono' id='sysIp'>IP %s</span>"
+            "<span class='pill' id='sysHeap'>Heap %u B</span>"
+            "<a class='btn bp' href='/wifi' style='margin:0;padding:6px 12px;font-size:.78rem'>Change Wi-Fi</a>"
+            "</div></div>",
+            state.wifiConnected ? "dok" : (state.apActive ? "dwrn" : "derr"),
+            state.gsmReady ? "dok" : "derr",
+            state.gpsValid ? "dok" : "dwrn",
+            currentDeviceIP().toString().c_str(),
+            ESP.getFreeHeap());
+        webServer.sendContent(buf);
+    }
+
+    // Hardware Bench card
+    webServer.sendContent(F(
+        "<div class='panel'><div class='phd'><h3>Hardware Diagnostics</h3></div>"
+        "<div class='pbd'><div class='bench'>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/buzzer',{method:'POST'}).then(()=>alert('Buzzer pulsed!'))\">Test Buzzer</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/leds',{method:'POST'}).then(()=>alert('Cycled LEDs!'))\">Cycle LEDs</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/lcd',{method:'POST'}).then(()=>alert('Blinked LCD!'))\">Blink LCD</button>"
+        "</div></div></div>"));
+
+    // SMS recipients card
+    webServer.sendContent(F("<div class='panel'><div class='phd'><h3>SMS recipients</h3>"
+        "<a class='btn bp' href=/sms style='margin:0;padding:6px 12px;font-size:.75rem'>Test &amp; edit</a>"
+        "</div><div class='pbd'>"));
+    for (int i = 0; i < cfg.numPhones; i++) {
+        webServer.sendContent(F("<span class='badge'>"));
+        webServer.sendContent(cfg.phones[i]);
+        webServer.sendContent(F("</span>"));
+    }
+    if (cfg.numPhones == 0)
+        webServer.sendContent(F("<p class=empty style=\"padding:8px 0;text-align:left\">None yet — open SMS Test to add numbers.</p>"));
+    webServer.sendContent(F("</div></div></div></div>"));
+
+    // Full Width KPI row (6 cards evenly distributed across 100% width)
     webServer.sendContent(F("<div class='kpis'>"));
     {
         const char* cls = (state.violationTier == 0) ? "safe"
                         : (state.violationTier <= 2) ? "warn" : "danger";
-        char buf[420];
+        char buf[512];
         snprintf(buf, sizeof(buf),
-            "<div class='kpi'><div class='l'>Speed</div><div class='v %s'>%d</div><div class='u'>km/h</div></div>"
-            "<div class='kpi'><div class='l'>Limit</div><div class='v'>%d</div><div class='u'>km/h</div></div>"
-            "<div class='kpi'><div class='l'>Alert</div><div class='v %s'>%s</div></div>"
-            "<div class='kpi'><div class='l'>Violations</div><div class='v'>%lu</div><div class='u'>this session</div></div>"
-            "<div class='kpi'><div class='l'>GPS</div><div class='v'>%s</div><div class='u'>%d sats</div></div>"
-            "<div class='kpi'><div class='l'>Peak</div><div class='v warn'>%d</div><div class='u'>km/h</div></div>",
+            "<div class='kpi'><div class='l'>Speed</div><div class='v %s' id='kpiSpd'>%d</div><div class='u'>km/h</div></div>"
+            "<div class='kpi'><div class='l'>Limit</div><div class='v' id='kpiLim'>%d</div><div class='u'>km/h</div></div>"
+            "<div class='kpi'><div class='l'>Alert</div><div class='v %s' id='kpiTier'>%s</div></div>"
+            "<div class='kpi'><div class='l'>Violations</div><div class='v' id='kpiViols'>%lu</div><div class='u'>this session</div></div>"
+            "<div class='kpi'><div class='l'>GPS</div><div class='v' id='kpiGps'>%s</div><div class='u' id='kpiSats'>%d sats</div></div>"
+            "<div class='kpi'><div class='l'>Peak</div><div class='v warn' id='kpiPeak'>%d</div><div class='u'>km/h</div></div>",
             cls, (int)state.currentSpeed,
             (int)state.speedLimit,
             cls,
@@ -1814,43 +2070,12 @@ void sendDashboard() {
     }
     webServer.sendContent(F("</div>"));
 
-    // System strip
-    {
-        char buf[280];
-        snprintf(buf, sizeof(buf),
-            "<div class='panel'><div class='phd'><h3>System</h3>"
-            "<span class='pill'><span class='dot %s'></span>Wi-Fi</span></div>"
-            "<div class='pbd' style='display:flex;flex-wrap:wrap;gap:10px;align-items:center'>"
-            "<span class='pill'><span class='dot %s'></span>GSM</span>"
-            "<span class='pill'><span class='dot %s'></span>GPS</span>"
-            "<span class='pill mono'>IP %s</span>"
-            "<span class='pill'>Heap %u B</span>"
-            "<a class='btn bp' href='/wifi' style='margin:0'>Change Wi-Fi</a>"
-            "</div></div>",
-            state.wifiConnected ? "dok" : (state.apActive ? "dwrn" : "derr"),
-            state.gsmReady ? "dok" : "derr",
-            state.gpsValid ? "dok" : "dwrn",
-            currentDeviceIP().toString().c_str(),
-            ESP.getFreeHeap());
-        webServer.sendContent(buf);
-    }
-
-    // SMS recipients
-    webServer.sendContent(F("<div class='panel'><div class='phd'><h3>SMS recipients</h3>"
-        "<a class='btn bp' href=/sms style='margin:0;padding:8px 12px;font-size:.75rem'>Test &amp; edit</a>"
-        "</div><div class='pbd'>"));
-    for (int i = 0; i < cfg.numPhones; i++) {
-        webServer.sendContent(F("<span class='badge'>"));
-        webServer.sendContent(cfg.phones[i]);
-        webServer.sendContent(F("</span>"));
-    }
-    if (cfg.numPhones == 0)
-        webServer.sendContent(F("<p class=empty style=\"padding:8px 0;text-align:left\">None yet — open SMS Test to add numbers.</p>"));
-    webServer.sendContent(F("</div></div>"));
-
-    // Violations
-    // Violations table wrap for mobile
-    webServer.sendContent(F("<div class='panel'><div class='phd'><h3>Recent violations</h3></div>"));
+    // Full Width Recent Violations Card (dynamic in-place updates, zero page reload)
+    webServer.sendContent(F(
+        "<div class='panel'><div class='phd'>"
+        "<h3>Recent violations</h3>"
+        "<span class='pill' style='font-size:.72rem'>Live Telemetry</span>"
+        "</div><div id='violationsBox'>"));
     if (logCount == 0) {
         webServer.sendContent(F("<div class='empty'>No violations this session.</div>"));
     } else {
@@ -1861,11 +2086,14 @@ void sendDashboard() {
         for (int i = logCount - 1; i >= 0; i--) {
             int idx = (start + i) % LOG_SIZE;
             ViolationRecord& r = violationLog[idx];
-            char row[220];
+            char row[240];
             snprintf(row, sizeof(row),
-                "<tr><td class='mono'>%d</td><td class='%s'>%s</td>"
-                "<td class='mono'>%d</td><td class='mono'>%d</td><td class='mono'>+%d</td>"
-                "<td class='mono' style='font-size:.72rem'>%.4f, %.4f</td></tr>",
+                "<tr><td class='mono'>%d</td>"
+                "<td><span class='tier-tag tier-%s'>%s</span></td>"
+                "<td class='mono'><b>%d</b> <span class='u'>km/h</span></td>"
+                "<td class='mono'>%d</td>"
+                "<td class='mono' style='color:var(--rose)'>+%d</td>"
+                "<td class='mono' style='font-size:.75rem'>%.4f, %.4f</td></tr>",
                 logCount - i, r.tier_str, r.tier_str,
                 (int)r.speed, (int)r.limit, (int)(r.speed - r.limit),
                 r.lat, r.lon);
@@ -1873,13 +2101,15 @@ void sendDashboard() {
         }
         webServer.sendContent(F("</tbody></table></div>"));
     }
-    webServer.sendContent(F("</div>"));
+    webServer.sendContent(F("</div></div>"));
+
+    // Stream dashboard JS from flash
+    webServer.sendContent_P(DASHBOARD_JS);
 
     htmlFoot();
     webServer.sendContent("");
 }
 
-// ── Settings page ─────────────────────────────────────────────
 void sendSettings() {
     webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
     webServer.send(200, F("text/html"), "");
@@ -1926,8 +2156,16 @@ void sendSettings() {
     if (state.sleepEnabled) webServer.sendContent(F(" checked"));
     webServer.sendContent(F("><span>Enable parked deep-sleep (5 min idle → sleep, MENU wakes)</span></label></div>"));
 
-    // Wiring reference
+    // Hardware Diagnostic Bench
     webServer.sendContent(F(
+        "<div class=fs><h2>Hardware Diagnostic Bench</h2>"
+        "<p class=lead>Test onboard indicators and alert hardware directly from this browser console.</p>"
+        "<div class=bench>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/buzzer',{method:'POST'}).then(()=>alert('Buzzer pulsed!'))\">Test Buzzer</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/leds',{method:'POST'}).then(()=>alert('Cycled LEDs!'))\">Cycle LEDs (G/Y/R)</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/lcd',{method:'POST'}).then(()=>alert('Cycled LCD backlight!'))\">Blink LCD</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/mute',{method:'POST'}).then(()=>alert('Buzzer muted 60s!'))\">Mute Buzzer (60s)</button>"
+        "</div></div>"
         "<div class=fs><h2>Hardware wiring</h2>"
         "<p class=lead>GPS TX/RX are crossed to the ESP32 UART.</p>"
         "<div class=pinmap>"
@@ -2255,6 +2493,39 @@ void sendViolationsJSON() {
 // ═══════════════════════════════════════════════════════════
 void setupWebServer() {
     webServer.on("/", HTTP_GET, sendDashboard);
+
+    webServer.on("/api/test/buzzer", HTTP_POST, []() {
+        digitalWrite(PIN_BUZZER, HIGH);
+        delay(150);
+        digitalWrite(PIN_BUZZER, LOW);
+        webServer.send(200, F("application/json"), F("{\"ok\":true}"));
+    });
+
+    webServer.on("/api/test/leds", HTTP_POST, []() {
+        digitalWrite(PIN_LED_GREEN, HIGH);
+        delay(120);
+        digitalWrite(PIN_LED_GREEN, LOW);
+        digitalWrite(PIN_LED_YELLOW, HIGH);
+        delay(120);
+        digitalWrite(PIN_LED_YELLOW, LOW);
+        digitalWrite(PIN_LED_RED, HIGH);
+        delay(120);
+        digitalWrite(PIN_LED_RED, LOW);
+        webServer.send(200, F("application/json"), F("{\"ok\":true}"));
+    });
+
+    webServer.on("/api/test/lcd", HTTP_POST, []() {
+        lcd.noBacklight();
+        delay(250);
+        lcd.backlight();
+        webServer.send(200, F("application/json"), F("{\"ok\":true}"));
+    });
+
+    webServer.on("/api/mute", HTTP_POST, []() {
+        state.buzzerMuteUntilMs = millis() + 60000;
+        silenceAlert();
+        webServer.send(200, F("application/json"), F("{\"ok\":true,\"muted_s\":60}"));
+    });
     webServer.on("/wifi", HTTP_GET, sendWifiSetup);
 
     webServer.on("/wifi", HTTP_POST, []() {
