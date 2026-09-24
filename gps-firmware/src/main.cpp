@@ -120,10 +120,8 @@ enum DeviceMode : uint8_t {
 
 const char* DEFAULT_NUMBERS[] = {
     "+2348135993811",
-    "+2348056322139"
+    "+2348056322139",
     "+2347059011222",
-
- 
 };
 // Auto-count: stays correct when you add/remove entries above
 constexpr int N_DEFAULT_NUMBERS =
@@ -1465,16 +1463,37 @@ void loadConfig() {
     if (cfg.numPhones <= 0 || cfg.numPhones > MAX_PHONE_NUMBERS)
         cfg.numPhones = N_DEFAULT_NUMBERS;
 
-    if (prefs.isKey("phonesStored") && prefs.getBool("phonesStored")) {
+    // Hash of DEFAULT_NUMBERS: changing the list in code re-seeds NVS once.
+    uint32_t defHash = 2166136261u;
+    for (int i = 0; i < N_DEFAULT_NUMBERS; i++) {
+        for (const char* p = DEFAULT_NUMBERS[i]; *p; ++p) {
+            defHash ^= (uint8_t)*p;
+            defHash *= 16777619u;
+        }
+        defHash ^= ',';
+        defHash *= 16777619u;
+    }
+    bool defaultsChanged = prefs.getUInt("phonesDefH", 0) != defHash;
+
+    if (!defaultsChanged && prefs.isKey("phonesStored") && prefs.getBool("phonesStored")) {
         for (int i = 0; i < cfg.numPhones; i++) {
             String key = "phone" + String(i);
             if (prefs.isKey(key.c_str()))
                 strncpy(cfg.phones[i], prefs.getString(key.c_str()).c_str(), 19);
         }
     } else {
-        for (int i = 0; i < N_DEFAULT_NUMBERS; i++)
+        for (int i = 0; i < N_DEFAULT_NUMBERS; i++) {
             strncpy(cfg.phones[i], DEFAULT_NUMBERS[i], 19);
+            cfg.phones[i][19] = '\0';
+        }
         cfg.numPhones = N_DEFAULT_NUMBERS;
+        prefs.end();
+        prefs.begin("gps-monitor", false);
+        prefs.putUInt("phonesDefH", defHash);
+        prefs.end();
+        saveConfig();
+        Serial.println(F("[NVS]  Phone defaults changed in firmware — re-seeded recipients"));
+        prefs.begin("gps-monitor", true);
     }
 
     prefs.end();
