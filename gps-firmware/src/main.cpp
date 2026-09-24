@@ -15,9 +15,9 @@
  *
  *  PIN MAP
  *  -------
- *  GPIO 27  →  Red  LED + Active Buzzer (alert)
+ *  GPIO 25  →  Red  LED + Active Buzzer (alert)
  *  GPIO 26  →  Yellow LED               (moderate warning)
- *  GPIO 25  →  Green LED                (speed compliant)
+ *  GPIO 27  →  Green LED                (speed compliant)
  *  GPIO 21  →  LCD I2C SDA
  *  GPIO 22  →  LCD I2C SCL
  *  GPIO 16  →  GPS  UART2 RX  (NEO-6M TX)
@@ -47,10 +47,13 @@
 // ═══════════════════════════════════════════════════════════
 //  PIN DEFINITIONS
 // ═══════════════════════════════════════════════════════════
-#define PIN_BUZZER       27
-#define PIN_LED_RED      27
+#define PIN_BUZZER       25
+#define PIN_LED_RED      25
+// Red LED + buzzer on GPIO 25 sound when the pin is driven HIGH.
+#define ALARM_ON         HIGH
+#define ALARM_OFF        LOW
 #define PIN_LED_YELLOW   26
-#define PIN_LED_GREEN    25
+#define PIN_LED_GREEN    27
 
 #define GPS_RX_PIN       16
 #define GPS_TX_PIN       17
@@ -311,12 +314,13 @@ void setup() {
 
     memset(postQueue, 0, sizeof(postQueue));
 
+    digitalWrite(PIN_LED_RED, ALARM_OFF);   // latch OFF before enabling output: no chirp at boot
     pinMode(PIN_LED_RED,    OUTPUT);
     pinMode(PIN_LED_YELLOW, OUTPUT);
     pinMode(PIN_LED_GREEN,  OUTPUT);
     pinMode(BTN_MENU,       INPUT_PULLUP);
     pinMode(BTN_SCROLL,     INPUT_PULLUP);
-    digitalWrite(PIN_LED_RED,    LOW);
+    digitalWrite(PIN_LED_RED,    ALARM_OFF);
     digitalWrite(PIN_LED_YELLOW, LOW);
     digitalWrite(PIN_LED_GREEN,  LOW);
 
@@ -556,31 +560,31 @@ void triggerAlert(int tier) {
         case 0:
             digitalWrite(PIN_LED_GREEN,  HIGH);
             digitalWrite(PIN_LED_YELLOW, LOW);
-            digitalWrite(PIN_LED_RED,    LOW);
+            digitalWrite(PIN_LED_RED,    ALARM_OFF);
             break;
         case 1:
             digitalWrite(PIN_LED_GREEN, LOW);
             if (now - lastBlinkMs > 500) { blinkState = !blinkState; lastBlinkMs = now; }
             digitalWrite(PIN_LED_YELLOW, blinkState);
-            digitalWrite(PIN_LED_RED,    LOW);
+            digitalWrite(PIN_LED_RED,    ALARM_OFF);
             break;
         case 2:
             digitalWrite(PIN_LED_GREEN,  LOW);
             digitalWrite(PIN_LED_YELLOW, HIGH);
             if (now - lastBlinkMs > 300) { blinkState = !blinkState; lastBlinkMs = now; }
-            digitalWrite(PIN_LED_RED, buzzerMuted ? LOW : blinkState);
+            digitalWrite(PIN_LED_RED, (!buzzerMuted && blinkState) ? ALARM_ON : ALARM_OFF);
             break;
         case 3:
             digitalWrite(PIN_LED_GREEN,  LOW);
             digitalWrite(PIN_LED_YELLOW, LOW);
             if (now - lastBlinkMs > 200) { blinkState = !blinkState; lastBlinkMs = now; }
-            digitalWrite(PIN_LED_RED, buzzerMuted ? LOW : blinkState);   // buzzer shares pin 27
+            digitalWrite(PIN_LED_RED, (!buzzerMuted && blinkState) ? ALARM_ON : ALARM_OFF);
             break;
     }
 }
 
 void silenceAlert() {
-    digitalWrite(PIN_LED_RED,    LOW);
+    digitalWrite(PIN_LED_RED,    ALARM_OFF);
     digitalWrite(PIN_LED_YELLOW, LOW);
 }
 
@@ -1632,7 +1636,15 @@ tr:hover td{background:#fafbfc}
 .statusline{min-height:1.2em;font-size:.82rem;color:var(--soft);margin-top:10px}
 .statusline.busy{color:#0369a1}.statusline.ok{color:var(--td)}.statusline.err{color:var(--rose)}
 .btn:disabled{opacity:.55;cursor:wait}
-.cnt{font:500 .72rem monospace;color:var(--mut);float:right;margin-top:-28px}
+button,.btn{transition:transform .08s ease,filter .08s ease,box-shadow .08s ease;-webkit-tap-highlight-color:rgba(15,157,138,.25);touch-action:manipulation}
+button:active,.btn:active{transform:scale(.95);filter:brightness(.88)}
+.btn.busy{position:relative;pointer-events:none;opacity:.75}
+.btn.busy:after{content:'';display:inline-block;width:12px;height:12px;margin-left:8px;vertical-align:-2px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.flash{animation:flash .5s ease}
+@keyframes flash{0%{box-shadow:0 0 0 0 rgba(15,157,138,.55)}100%{box-shadow:0 0 0 10px rgba(15,157,138,0)}}
+.target{font-size:.82rem;color:var(--soft);margin-top:8px}.target b{color:var(--td)}
+.cnt{font:500 .72rem monospace;color:var(--mut);float:right}
 .quick{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
 .quick button{border:1px solid var(--line);background:#f7fafc;border-radius:8px;padding:7px 10px;font-size:.75rem;cursor:pointer;color:var(--soft)}
 .quick button:hover,.quick button.on{border-color:var(--teal);color:var(--td);background:#d9f3ee}
@@ -1812,16 +1824,17 @@ static void htmlFoot() {
 // Escape so SSID never breaks value='...'
 static void sendHtmlAttr(const char* s) {
     if (!s) return;
+    // One chunk per call: per-character chunks overflow the TCP buffer and truncate pages.
+    String out;
+    out.reserve(strlen(s) + 16);
     for (; *s; ++s) {
-        if (*s == '&')      webServer.sendContent(F("&amp;"));
-        else if (*s == '\'') webServer.sendContent(F("&#39;"));
-        else if (*s == '"')  webServer.sendContent(F("&quot;"));
-        else if (*s == '<')  webServer.sendContent(F("&lt;"));
-        else {
-            char c[2] = { *s, 0 };
-            webServer.sendContent(c);
-        }
+        if (*s == '&')       out += F("&amp;");
+        else if (*s == '\'') out += F("&#39;");
+        else if (*s == '"')  out += F("&quot;");
+        else if (*s == '<')  out += F("&lt;");
+        else                 out += *s;
     }
+    if (out.length()) webServer.sendContent(out);
 }
 
 // ── Wi-Fi onboarding (captive portal target) ─────────────────
@@ -2021,7 +2034,7 @@ void sendDashboard() {
 
     // System Diagnostics card
     {
-        char buf[360];
+        char buf[768];
         snprintf(buf, sizeof(buf),
             "<div class='panel'><div class='phd'><h3>System Diagnostics</h3>"
             "<span class='pill'><span class='dot %s' id='sysWifiDot'></span>Wi-Fi</span></div>"
@@ -2067,7 +2080,7 @@ void sendDashboard() {
     {
         const char* cls = (state.violationTier == 0) ? "safe"
                         : (state.violationTier <= 2) ? "warn" : "danger";
-        char buf[512];
+        char buf[900];
         snprintf(buf, sizeof(buf),
             "<div class='kpi'><div class='l'>Speed</div><div class='v %s' id='kpiSpd'>%d</div><div class='u'>km/h</div></div>"
             "<div class='kpi'><div class='l'>Limit</div><div class='v' id='kpiLim'>%d</div><div class='u'>km/h</div></div>"
@@ -2105,7 +2118,7 @@ void sendDashboard() {
         for (int i = logCount - 1; i >= 0; i--) {
             int idx = (start + i) % LOG_SIZE;
             ViolationRecord& r = violationLog[idx];
-            char row[240];
+            char row[360];
             snprintf(row, sizeof(row),
                 "<tr><td class='mono'>%d</td>"
                 "<td><span class='tier-tag tier-%s'>%s</span></td>"
@@ -2193,12 +2206,15 @@ void sendSettings() {
         "GPS GND        →  ESP32 GND<br>"
         "GPS VCC        →  3.3V or 5V (per module)<br><br>"
         "SIM800L TX     →  ESP32 GPIO 13 (RX)<br>"
-        "SIM800L RX     →  ESP32 GPIO 14 (TX) &nbsp;(level shift if 5V logic)"
+        "SIM800L RX     →  ESP32 GPIO 14 (TX) &nbsp;(level shift if 5V logic)<br><br>"
+        "Green LED      →  ESP32 GPIO 27<br>"
+        "Yellow LED     →  ESP32 GPIO 26<br>"
+        "Red LED + buzzer → ESP32 GPIO 25"
         "</div></div>"));
 
     // Thresholds
     {
-        char buf[480];
+        char buf[640];
         snprintf(buf, sizeof(buf),
             "<div class='fs'><h2>Speed thresholds</h2>"
             "<label>Default speed limit (km/h)</label>"
@@ -2260,6 +2276,58 @@ void sendSettings() {
     webServer.sendContent("");
 }
 
+static const char SMS_PAGE_JS[] PROGMEM = R"JS(<script>
+function E(i){return document.getElementById(i)}
+function st(id,t,c){var e=E(id);if(e){e.className='statusline '+(c||'');e.textContent=t||''}}
+function busy(b,on,label){if(!b)return;if(on){b._t=b.textContent;b.textContent=label;b.classList.add('busy');b.disabled=true}
+else{b.textContent=b._t||b.textContent;b.classList.remove('busy');b.disabled=false}}
+function flash(el){if(!el)return;el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash')}
+function nAll(){return E('quick').querySelectorAll('button[data-n]').length-1}
+function target(){var v=E('phone').value.trim(),t=E('target');if(!t)return;
+if(v){t.innerHTML='Sending to: <b></b>';t.firstElementChild.textContent=v}
+else t.innerHTML='Sending to: <b>all '+nAll()+' saved recipients</b>'}
+function pick(b){E('phone').value=b.getAttribute('data-n')||'';
+var q=E('quick').querySelectorAll('button');for(var i=0;i<q.length;i++)q[i].classList.remove('on');
+b.classList.add('on');flash(b);target()}
+function typed(){var v=E('phone').value.trim(),q=E('quick').querySelectorAll('button');
+for(var i=0;i<q.length;i++)q[i].classList.toggle('on',(q[i].getAttribute('data-n')||'')===v);target()}
+function cnt(){var m=E('message'),c=E('cnt');if(m&&c)c.textContent=m.value.length+'/140'}
+function post(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body||''})
+.then(function(r){return r.json()})}
+function sendSms(b){var v=E('phone').value.trim(),body='message='+encodeURIComponent(E('message').value);
+if(v)body+='&phone='+encodeURIComponent(v);
+busy(b,true,'Sending...');
+st('sendStatus',v?'Sending to '+v+' (can take ~10s)...':'Sending to all saved recipients (~10s each)...','busy');
+post('/api/sms',body).then(function(d){busy(b,false);st('sendStatus',d.detail||(d.ok?'Sent':'Failed'),d.ok?'ok':'err')})
+.catch(function(){busy(b,false);st('sendStatus','No response from device','err')})}
+function reinit(b){busy(b,true,'Re-initialising...');st('sendStatus','Re-initialising modem...','busy');
+post('/api/gsm-reinit').then(function(d){busy(b,false);var t=E('gsmTitle'),c=E('gsmChip');
+t.textContent=d.ok?'Modem ready':'Modem not ready';t.className=d.ok?'ok':'bad';c.textContent='GSM: '+(d.ok?'OK':'FAILED');
+st('sendStatus',d.detail||'',d.ok?'ok':'err')})
+.catch(function(){busy(b,false);st('sendStatus','No response from device','err')})}
+function addRow(){var l=E('pl');if(l.children.length>=10){st('phStatus','Maximum 10 numbers','err');return}
+var d=document.createElement('div');d.className='pi';
+d.innerHTML="<input type=tel maxlength=19 placeholder='+234...'><button type=button class=rm onclick=rmRow(this)>Remove</button>";
+l.appendChild(d);var i=d.querySelector('input');i.focus();flash(i);st('phStatus','Type the new number, then tap Save','')}
+function rmRow(b){var l=E('pl'),row=b.parentNode;
+if(l.children.length<=1){row.querySelector('input').value='';return}
+l.removeChild(row);st('phStatus','Removed - tap Save to apply','')}
+function drawQuick(list){var q=E('quick');q.innerHTML='';
+var a=document.createElement('button');a.type='button';a.setAttribute('data-n','');a.textContent='All ('+list.length+')';
+a.onclick=function(){pick(a)};q.appendChild(a);
+list.forEach(function(n){var b=document.createElement('button');b.type='button';b.setAttribute('data-n',n);b.textContent=n;
+b.onclick=function(){pick(b)};q.appendChild(b)});
+E('rcChip').textContent='Recipients: '+list.length;typed()}
+function saveNums(b){var ins=E('pl').querySelectorAll('input'),list=[],seen={};
+for(var i=0;i<ins.length;i++){var v=ins[i].value.replace(/\s+/g,'');if(v.length>=7&&!seen[v]){seen[v]=1;list.push(v)}}
+var body='clearPhones=1';list.forEach(function(n,i){body+='&phone'+i+'='+encodeURIComponent(n)});
+busy(b,true,'Saving...');st('phStatus','Saving...','busy');
+post('/api/recipients',body).then(function(d){busy(b,false);
+if(!d.ok){st('phStatus',d.detail||'Save failed','err');return}
+var saved=d.phones||list;drawQuick(saved);st('phStatus','Saved '+saved.length+' recipient(s)','ok')})
+.catch(function(){busy(b,false);st('phStatus','No response from device','err')})}
+</script>)JS";
+
 void sendSmsTest() {
     webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
     webServer.send(200, F("text/html"), "");
@@ -2267,18 +2335,21 @@ void sendSmsTest() {
     htmlHead("SMS Test — Velocis");
     htmlTop("sms");
 
+    // Handlers first, in one chunk, so buttons work even if the page tail is slow.
+    webServer.sendContent_P(SMS_PAGE_JS);
+
     {
-        char buf[280];
+        char buf[560];
         snprintf(buf, sizeof(buf),
             "<div class=hero><div class=eyebrow>GSM tools</div>"
             "<h2 class='%s' id=gsmTitle>%s</h2>"
-            "<p class=sub>Tap a recipient, edit the message, send instantly — no page reload.</p>"
+            "<p class=sub>Tap a number to select it, edit the message, then send.</p>"
             "<div class=chips>"
             "<span class=chip id=gsmChip>GSM: %s</span>"
             "<span class=chip id=rcChip>Recipients: %d</span>"
             "</div>"
             "<div class=row style=\"margin-top:12px\">"
-            "<button type=button class='btn bg' id=btnReinit>Re-init modem</button>"
+            "<button type=button class='btn bg' id=btnReinit onclick=reinit(this)>Re-init modem</button>"
             "</div></div>",
             state.gsmReady ? "ok" : "bad",
             state.gsmReady ? "Modem ready" : "Modem not ready",
@@ -2290,15 +2361,50 @@ void sendSmsTest() {
     webServer.sendContent(F(
         "<div class='fs hi'>"
         "<h2>Send test SMS</h2>"
-        "<p class=lead>Tap a saved number below, or leave blank to message everyone.</p>"
+        "<p class=lead>Saved recipients — tap one to send only to that number:</p>"
+        "<div class=quick id=quick>"));
+    {
+        char b[112];
+        snprintf(b, sizeof(b),
+            "<button type=button class=on data-n='' onclick=pick(this)>All (%d)</button>",
+            cfg.numPhones);
+        webServer.sendContent(b);
+    }
+    for (int i = 0; i < cfg.numPhones; i++) {
+        webServer.sendContent(F("<button type=button data-n='"));
+        sendHtmlAttr(cfg.phones[i]);
+        webServer.sendContent(F("' onclick=pick(this)>"));
+        sendHtmlAttr(cfg.phones[i]);
+        webServer.sendContent(F("</button>"));
+    }
+    if (cfg.numPhones == 0)
+        webServer.sendContent(F("<span class=hint>No saved numbers yet — add some below.</span>"));
+
+    webServer.sendContent(F("</div>"
         "<label for=phone>To</label>"
-        "<input id=phone type=tel maxlength=19 placeholder=\"+234... or blank = all recipients\">"
-        "<div class=quick id=quick></div>"
-        "<label for=message>Message <span class=cnt id=cnt>0/140</span></label>"
-        "<textarea id=message rows=4 maxlength=140 placeholder=\"ASCII only — best for SIM800L\"></textarea>"
+        "<input id=phone type=tel maxlength=19 oninput=typed() "
+        "placeholder=\"Blank = all saved recipients\">"));
+    {
+        char t[128];
+        snprintf(t, sizeof(t),
+            "<div class=target id=target>Sending to: <b>all %d saved recipients</b></div>",
+            cfg.numPhones);
+        webServer.sendContent(t);
+    }
+
+    webServer.sendContent(F(
+        "<label for=message>Message <span class=cnt id=cnt></span></label>"
+        "<textarea id=message rows=4 maxlength=140 oninput=cnt()>"));
+    {
+        char def[120];
+        snprintf(def, sizeof(def),
+            "Velocis TEST from %s - SMS OK. Speed %.0f km/h",
+            cfg.deviceID, state.currentSpeed);
+        sendHtmlAttr(def);
+    }
+    webServer.sendContent(F("</textarea>"
         "<div class=row>"
-        "<button class='btn bp' type=button id=btnSend>Send test SMS</button>"
-        "<button class='btn bg' type=button id=btnAll>Send to all</button>"
+        "<button class='btn bp' type=button id=btnSend onclick=sendSms(this)>Send SMS</button>"
         "</div>"
         "<div class=statusline id=sendStatus></div>"
         "<p class=hint>SIM800L: TX→GPIO13, RX→GPIO14, shared GND, solid 2A supply. "
@@ -2308,144 +2414,23 @@ void sendSmsTest() {
     webServer.sendContent(F(
         "<div class=fs>"
         "<h2>Edit recipients</h2>"
-        "<p class=lead>Add or remove numbers here. Changes save to the device immediately.</p>"
-        "<div id=pl></div>"
-        "<button type=button class=add id=btnAdd>+ Add number</button>"
+        "<p class=lead>Add, change or remove numbers, then tap Save.</p>"
+        "<div id=pl>"));
+    int rows = cfg.numPhones > 0 ? cfg.numPhones : 1;
+    for (int i = 0; i < rows; i++) {
+        webServer.sendContent(F("<div class=pi><input type=tel maxlength=19 placeholder='+234...' value='"));
+        if (i < cfg.numPhones) sendHtmlAttr(cfg.phones[i]);
+        webServer.sendContent(F("'><button type=button class=rm onclick=rmRow(this)>Remove</button></div>"));
+    }
+    webServer.sendContent(F("</div>"
+        "<button type=button class=add onclick=addRow()>+ Add number</button>"
         "<div class=row>"
-        "<button class='btn bp' type=button id=btnSavePh>Save recipients</button>"
+        "<button class='btn bp' type=button onclick=saveNums(this)>Save recipients</button>"
         "</div>"
         "<div class=statusline id=phStatus></div>"
         "<p class=hint>International format, e.g. +2347059011222 (max 10)</p>"
-        "</div>"));
-
-    // Seed phones + default message as JS
-    webServer.sendContent(F("<script>var phones=["));
-    for (int i = 0; i < cfg.numPhones; i++) {
-        if (i) webServer.sendContent(F(","));
-        webServer.sendContent(F("\""));
-        // Escape for JS string
-        for (const char* p = cfg.phones[i]; *p; ++p) {
-            if (*p == '\\' || *p == '"') {
-                char e[3] = { '\\', *p, 0 };
-                webServer.sendContent(e);
-            } else {
-                char c[2] = { *p, 0 };
-                webServer.sendContent(c);
-            }
-        }
-        webServer.sendContent(F("\""));
-    }
-    webServer.sendContent(F("];var defMsg=\""));
-    {
-        char def[120];
-        snprintf(def, sizeof(def),
-            "Velocis TEST from %s - SMS OK. Speed %.0f km/h",
-            cfg.deviceID, state.currentSpeed);
-        for (const char* p = def; *p; ++p) {
-            if (*p == '\\' || *p == '"') {
-                char e[3] = { '\\', *p, 0 };
-                webServer.sendContent(e);
-            } else if (*p == '\n' || *p == '\r') {
-                webServer.sendContent(F(" "));
-            } else {
-                char c[2] = { *p, 0 };
-                webServer.sendContent(c);
-            }
-        }
-    }
-    webServer.sendContent(F("\";</script>"));
-
-    webServer.sendContent(F(
-        "<script>"
-        "var msg=document.getElementById('message');"
-        "var phone=document.getElementById('phone');"
-        "var cnt=document.getElementById('cnt');"
-        "var sendStatus=document.getElementById('sendStatus');"
-        "var phStatus=document.getElementById('phStatus');"
-        "var pl=document.getElementById('pl');"
-        "var quick=document.getElementById('quick');"
-        "msg.value=defMsg;"
-        "function updCnt(){cnt.textContent=msg.value.length+'/140';}"
-        "msg.addEventListener('input',updCnt);updCnt();"
-        "function setSt(el,t,cls){el.className='statusline '+(cls||'');el.textContent=t||'';}"
-        "function renderQuick(){"
-        "quick.innerHTML='';"
-        "if(!phones.length){quick.innerHTML='<span class=hint>No saved numbers yet</span>';return;}"
-        "phones.forEach(function(n){"
-        "var b=document.createElement('button');b.type='button';b.textContent=n;"
-        "b.onclick=function(){"
-        "phone.value=n;"
-        "[].forEach.call(quick.querySelectorAll('button'),function(x){x.classList.remove('on');});"
-        "b.classList.add('on');phone.focus();};"
-        "quick.appendChild(b);});"
-        "var a=document.createElement('button');a.type='button';a.textContent='All recipients';"
-        "a.onclick=function(){phone.value='';"
-        "[].forEach.call(quick.querySelectorAll('button'),function(x){x.classList.remove('on');});"
-        "a.classList.add('on');};"
-        "quick.appendChild(a);}"
-        "function renderList(){"
-        "pl.innerHTML='';"
-        "var list=phones.length?phones.slice():[''];"
-        "list.forEach(function(n,i){"
-        "var d=document.createElement('div');d.className='pi';"
-        "var inp=document.createElement('input');inp.type='tel';inp.maxLength=19;"
-        "inp.placeholder='+234...';inp.value=n;"
-        "var rm=document.createElement('button');rm.type='button';rm.className='rm';rm.textContent='Remove';"
-        "rm.onclick=function(){"
-        "if(pl.children.length<=1){inp.value='';return;}"
-        "d.remove();};"
-        "d.appendChild(inp);d.appendChild(rm);pl.appendChild(d);});"
-        "document.getElementById('rcChip').textContent='Recipients: '+phones.length;}"
-        "function collect(){"
-        "var out=[],seen={};"
-        "[].forEach.call(pl.querySelectorAll('input'),function(inp){"
-        "var v=(inp.value||'').replace(/\\s+/g,'');"
-        "if(v.length>=7&&!seen[v]){seen[v]=1;out.push(v);}});"
-        "return out;}"
-        "document.getElementById('btnAdd').onclick=function(){"
-        "if(pl.children.length>=10){alert('Max 10');return;}"
-        "var d=document.createElement('div');d.className='pi';"
-        "d.innerHTML=\"<input type=tel maxlength=19 placeholder='+234...'>"
-        "<button type=button class=rm>Remove</button>\";"
-        "d.querySelector('.rm').onclick=function(){"
-        "if(pl.children.length<=1){d.querySelector('input').value='';return;}d.remove();};"
-        "pl.appendChild(d);d.querySelector('input').focus();};"
-        "document.getElementById('btnSavePh').onclick=function(){"
-        "var list=collect();"
-        "var body='clearPhones=1';"
-        "list.forEach(function(n,i){body+='&phone'+i+'='+encodeURIComponent(n);});"
-        "setSt(phStatus,'Saving…','busy');"
-        "fetch('/api/recipients',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
-        ".then(function(r){return r.json();}).then(function(d){"
-        "if(!d.ok){setSt(phStatus,d.detail||'Save failed','err');return;}"
-        "phones=d.phones||list;renderQuick();renderList();"
-        "setSt(phStatus,'Saved '+phones.length+' recipient(s)','ok');"
-        "}).catch(function(){setSt(phStatus,'Network error','err');});};"
-        "function doSend(toAll){"
-        "var body='message='+encodeURIComponent(msg.value||defMsg);"
-        "if(!toAll&&phone.value.trim())body+='&phone='+encodeURIComponent(phone.value.trim());"
-        "var btn=document.getElementById('btnSend');"
-        "var btn2=document.getElementById('btnAll');"
-        "btn.disabled=btn2.disabled=true;"
-        "setSt(sendStatus,'Sending via SIM800L… this can take ~10s','busy');"
-        "fetch('/api/sms',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
-        ".then(function(r){return r.json();}).then(function(d){"
-        "btn.disabled=btn2.disabled=false;"
-        "setSt(sendStatus,d.detail||(d.ok?'Sent':'Failed'),d.ok?'ok':'err');"
-        "}).catch(function(){btn.disabled=btn2.disabled=false;setSt(sendStatus,'Network error','err');});}"
-        "document.getElementById('btnSend').onclick=function(){doSend(false);};"
-        "document.getElementById('btnAll').onclick=function(){phone.value='';doSend(true);};"
-        "document.getElementById('btnReinit').onclick=function(){"
-        "setSt(sendStatus,'Re-initialising modem…','busy');"
-        "fetch('/api/gsm-reinit',{method:'POST'}).then(function(r){return r.json();}).then(function(d){"
-        "var t=document.getElementById('gsmTitle');var c=document.getElementById('gsmChip');"
-        "if(d.ok){t.textContent='Modem ready';t.className='ok';c.textContent='GSM: OK';"
-        "setSt(sendStatus,'Modem ready','ok');}"
-        "else{t.textContent='Modem not ready';t.className='bad';c.textContent='GSM: FAILED';"
-        "setSt(sendStatus,d.detail||'Re-init failed','err');}"
-        "}).catch(function(){setSt(sendStatus,'Network error','err');});};"
-        "renderQuick();renderList();"
-        "</script>"));
+        "</div>"
+        "<script>cnt();</script>"));
 
     htmlFoot();
     webServer.sendContent("");
@@ -2514,9 +2499,9 @@ void setupWebServer() {
     webServer.on("/", HTTP_GET, sendDashboard);
 
     webServer.on("/api/test/buzzer", HTTP_POST, []() {
-        digitalWrite(PIN_BUZZER, HIGH);
+        digitalWrite(PIN_BUZZER, ALARM_ON);
         delay(150);
-        digitalWrite(PIN_BUZZER, LOW);
+        digitalWrite(PIN_BUZZER, ALARM_OFF);
         webServer.send(200, F("application/json"), F("{\"ok\":true}"));
     });
 
@@ -2527,9 +2512,9 @@ void setupWebServer() {
         digitalWrite(PIN_LED_YELLOW, HIGH);
         delay(120);
         digitalWrite(PIN_LED_YELLOW, LOW);
-        digitalWrite(PIN_LED_RED, HIGH);
+        digitalWrite(PIN_LED_RED, ALARM_ON);
         delay(120);
-        digitalWrite(PIN_LED_RED, LOW);
+        digitalWrite(PIN_LED_RED, ALARM_OFF);
         webServer.send(200, F("application/json"), F("{\"ok\":true}"));
     });
 
