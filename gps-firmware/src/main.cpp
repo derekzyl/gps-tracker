@@ -88,12 +88,19 @@
 #define GPS_STALE_MS          3000
 #define UI_ROTATE_MS          4000
 #define UI_PAUSE_MS           12000
-#define BTN_DEBOUNCE_MS       280
+#define BTN_DEBOUNCE_MS       30     // level must be stable this long to count
 #define BTN_LONG_MS           3000
+#define BTN_HOLD_HINT_MS      800    // tap if released sooner; show hold bar after this
 #define INTERNET_TEST_MS      4000
 #define PROV_LCD_ROTATE_MS    3000
 #define HEARTBEAT_MS          30000
 #define GEO_SYNC_MS           300000
+#define TRACK_BUF             60         // GPS log points kept in RAM (~5 min moving)
+#define TRACK_MOVING_MS       5000
+#define TRACK_PARKED_MS       60000
+#define TRACK_UPLOAD_MS       15000
+#define TRACK_RETRY_MS        60000      // back-off after a failed upload
+#define TRACK_BATCH           20
 #define QUEUE_SIZE            12
 #define MAX_DYN_ZONES         16
 #define PARKED_SPEED_KPH      2.0f
@@ -108,6 +115,7 @@
 // ── UI / network modes ───────────────────────────────────────
 enum UiScreen : uint8_t {
     UI_SPEED = 0,
+    UI_LIMIT,
     UI_WIFI,
     UI_GPS,
     UI_STATS,
@@ -189,7 +197,9 @@ struct Config {
     char   serverURL[128]     = "http://visiting-carmella-cybergenii-895c1fde.koyeb.app/api/violation";
     char   deviceID[32]       = "ESP32-SPEED-01";
     char   apiKey[48]         = "";
-    int    defaultSpeedLimit  = DEFAULT_SPEED_LIMIT;
+    int    defaultSpeedLimit  = DEFAULT_SPEED_LIMIT;  // the limit you set (manual mode)
+    bool   autoZones          = false;                // true: map zones override the set limit
+    uint32_t limitRev         = 0;                    // last server limit revision applied
     int    threshMinor        = THRESH_MINOR;
     int    threshModerate     = THRESH_MODERATE;
     int    threshSevere       = THRESH_SEVERE;
@@ -225,9 +235,26 @@ ViolationRecord violationLog[LOG_SIZE];
 int logHead  = 0;
 int logCount = 0;
 
+// ── GPS track ring buffer (newest trackUnsent points await upload) ──
+struct TrackPoint {
+    float lat, lon, speed, limit;
+    unsigned long ms;
+};
+TrackPoint trackBuf[TRACK_BUF];
+int trackHead   = 0;
+int trackCount  = 0;
+int trackUnsent = 0;
+unsigned long trackTotal        = 0;
+unsigned long trackUploaded     = 0;
+unsigned long lastTrackMs       = 0;
+unsigned long nextTrackUploadMs = 0;
+
 // ── Alert blink state ────────────────────────────────────────
 unsigned long lastBlinkMs = 0;
 bool blinkState = false;
+
+// Transient LCD message (e.g. "Alarm muted") protected from the live refresh until this time.
+unsigned long lcdHoldUntil = 0;
 
 // ═══════════════════════════════════════════════════════════
 //  FORWARD DECLARATIONS
@@ -245,6 +272,7 @@ void setupWebServer();
 void handleGPS();
 float haversineSpeed(float, float, float, float, float);
 float getSpeedLimit(float, float);
+void setSpeedLimit(int kph, bool autoZones);
 void processViolation(float, float, float, float);
 void triggerAlert(int);
 void silenceAlert();
@@ -257,6 +285,11 @@ void enqueuePost(float, float, float, float, const char*);
 void flushPostQueue();
 bool sendHeartbeat();
 bool syncGeofences();
+void recordTrackPoint(float lat, float lon, float speed, float limit);
+bool uploadTrack();
+void applyServerLimit(JsonVariantConst lim);
+void sendTrackJSON();
+static void showLcdMsg(const char* l1, const char* l2, unsigned long ms);
 void setupOTA();
 String serverBaseURL();
 void addApiHeaders(HTTPClient& http);
@@ -269,7 +302,9 @@ void truncate16(char* dest, const char* src);
 void renderUi(bool force = false);
 void renderProvisioningLcd();
 void renderStatusScreen(UiScreen screen);
+void setupButtons();
 void handleButtons();
+bool buttonHoldActive();
 void sendDashboard();
 void sendSettings();
 void sendWifiSetup();
@@ -331,6 +366,8 @@ void setup() {
     updateLCD("Velocis v1.4", "Starting...");
 
     loadConfig();
+    state.speedLimit = (float)cfg.defaultSpeedLimit;
+    setupButtons();
 
     gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     gsmSerial.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
@@ -385,11 +422,28 @@ void loop() {
         handleGPS();
 
     unsigned long now = millis();
+
+    // Fix lost: stop checking a stale speed and silence any alarm.
+    if (state.gpsValid && gps.location.age() > GPS_STALE_MS * 2) {
+        state.gpsValid = false;
+        state.currentSpeed = 0.0f;
+        state.prevFixMs = 0;
+        state.violationTier = 0;
+        silenceAlert();
+        Serial.println(F("[GPS]  Fix lost"));
+    }
+
+    // Alarm blink cadence (200–500 ms) needs a faster tick than 1 Hz GPS fixes.
+    if (state.gpsValid && state.violationTier > 0)
+        triggerAlert(state.violationTier);
     if (state.wifiConnected && state.internetOk) {
         if (now - state.lastHeartbeatMs >= HEARTBEAT_MS) {
             state.lastHeartbeatMs = now;
             sendHeartbeat();
             flushPostQueue();
+        }
+        if (trackUnsent > 0 && (long)(now - nextTrackUploadMs) >= 0) {
+            nextTrackUploadMs = now + (uploadTrack() ? TRACK_UPLOAD_MS : TRACK_RETRY_MS);
         }
         if (now - state.lastGeoSyncMs >= GEO_SYNC_MS) {
             state.lastGeoSyncMs = now;
@@ -449,6 +503,7 @@ void handleGPS() {
 
     // LCD is owned by renderUi() — do not overwrite here
     processViolation(speed, state.speedLimit, lat, lon);
+    recordTrackPoint(lat, lon, speed, state.speedLimit);
 
     state.prevLat   = lat;
     state.prevLon   = lon;
@@ -487,6 +542,8 @@ const SpeedZone ZONES[] = {
 const int N_ZONES = sizeof(ZONES) / sizeof(SpeedZone);
 
 float getSpeedLimit(float lat, float lon) {
+    if (!cfg.autoZones) return (float)cfg.defaultSpeedLimit;
+
     for (int i = 0; i < state.dynZoneCount; i++)
         if (lat >= dynZones[i].latMin && lat <= dynZones[i].latMax &&
             lon >= dynZones[i].lonMin && lon <= dynZones[i].lonMax)
@@ -497,6 +554,23 @@ float getSpeedLimit(float lat, float lon) {
             lon >= ZONES[i].lonMin && lon <= ZONES[i].lonMax)
             return ZONES[i].limitKph;
     return (float)cfg.defaultSpeedLimit;
+}
+
+// Applies immediately (display + alarm) and persists to NVS.
+void setSpeedLimit(int kph, bool autoZones) {
+    if (kph < 5)   kph = 5;
+    if (kph > 250) kph = 250;
+    cfg.defaultSpeedLimit = kph;
+    cfg.autoZones = autoZones;
+    state.speedLimit = state.gpsValid ? getSpeedLimit(state.prevLat, state.prevLon)
+                                      : (float)kph;
+    if (state.currentSpeed <= state.speedLimit && state.violationTier > 0) {
+        state.violationTier = 0;
+        silenceAlert();
+    }
+    saveConfig();
+    Serial.printf("[LIMIT] %d km/h (%s) -> effective %.0f\n",
+                  kph, autoZones ? "AUTO zones" : "MANUAL", state.speedLimit);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -514,23 +588,27 @@ void processViolation(float speed, float limit, float lat, float lon) {
     int tier = (excess >= (float)cfg.threshSevere)   ? 3 :
                (excess >= (float)cfg.threshModerate) ? 2 : 1;
 
+    // One violation per event: entering over-limit or escalating tier, not every fix.
+    bool newEvent = tier > state.violationTier;
     state.violationTier = tier;
-    state.totalViolations++;
     triggerAlert(tier);
 
     const char* tierStr = (tier == 3) ? "SEVERE" : (tier == 2) ? "MODERATE" : "MINOR";
-    Serial.printf("[ALERT] Tier=%d (%s)  Excess=+%.1f km/h\n", tier, tierStr, excess);
-
-    logViolation(speed, limit, lat, lon, tier);
+    if (newEvent) {
+        state.totalViolations++;
+        logViolation(speed, limit, lat, lon, tier);
+        Serial.printf("[ALERT] Tier=%d (%s)  Excess=+%.1f km/h\n", tier, tierStr, excess);
+    }
 
     unsigned long now = millis();
 
     if (tier == 3) {
         if (now - state.lastSmsMs > SMS_COOLDOWN_MS) {
+            // Keep under 160 chars (one SMS); the link opens Google Maps on the phone.
             char msg[160];
             snprintf(msg, sizeof(msg),
                 "SPEED ALERT [%s]\nDevice: %s\nSpeed: %.0f km/h in %.0f km/h zone\n"
-                "Excess: +%.0f km/h\nLat: %.6f  Lon: %.6f",
+                "Excess: +%.0f km/h\nhttps://maps.google.com/?q=%.5f,%.5f",
                 tierStr, cfg.deviceID, speed, limit, excess, lat, lon);
             if (sendSMS(msg)) state.lastSmsMs = now;
         }
@@ -847,17 +925,21 @@ bool sendHeartbeat() {
     addApiHeaders(http);
     http.setTimeout(SERVER_TIMEOUT_MS);
 
-    StaticJsonDocument<384> doc;
-    doc["device"]      = cfg.deviceID;
-    doc["speed"]       = state.currentSpeed;
-    doc["limit"]       = state.speedLimit;
-    doc["lat"]         = state.gpsValid ? state.prevLat : 0;
-    doc["lon"]         = state.gpsValid ? state.prevLon : 0;
-    doc["gps_valid"]   = state.gpsValid;
-    doc["wifi_rssi"]   = WiFi.RSSI();
-    doc["free_heap"]   = ESP.getFreeHeap();
-    doc["internet_ok"] = state.internetOk;
-    doc["queue"]       = state.pendingQueue;
+    StaticJsonDocument<512> doc;
+    doc["device"]        = cfg.deviceID;
+    doc["speed"]         = state.currentSpeed;
+    doc["limit"]         = state.speedLimit;
+    doc["lat"]           = state.gpsValid ? state.prevLat : 0;
+    doc["lon"]           = state.gpsValid ? state.prevLon : 0;
+    doc["gps_valid"]     = state.gpsValid;
+    doc["wifi_rssi"]     = WiFi.RSSI();
+    doc["free_heap"]     = ESP.getFreeHeap();
+    doc["internet_ok"]   = state.internetOk;
+    doc["queue"]         = state.pendingQueue;
+    doc["track_unsent"]  = trackUnsent;
+    doc["limit_setting"] = cfg.defaultSpeedLimit;
+    doc["limit_mode"]    = cfg.autoZones ? "auto" : "manual";
+    doc["limit_rev"]     = cfg.limitRev;
     if (strlen(cfg.apiKey) > 0) doc["api_key"] = cfg.apiKey;
 
     String payload;
@@ -869,7 +951,9 @@ bool sendHeartbeat() {
         // Optionally refresh geofences from heartbeat response
         String body = http.getString();
         StaticJsonDocument<2048> resp;
-        if (!deserializeJson(resp, body) && resp["geofences"].is<JsonArray>()) {
+        bool parsed = !deserializeJson(resp, body);
+        if (parsed) applyServerLimit(resp["limit"]);
+        if (parsed && resp["geofences"].is<JsonArray>()) {
             JsonArray arr = resp["geofences"].as<JsonArray>();
             int n = 0;
             for (JsonObject z : arr) {
@@ -890,6 +974,89 @@ bool sendHeartbeat() {
         Serial.printf("[HB]   OK zones=%d\n", state.dynZoneCount);
     } else {
         Serial.printf("[HB]   HTTP %d\n", code);
+    }
+    http.end();
+    return ok;
+}
+
+// Server response {"limit":{"kph","mode","rev"}} = a dashboard edit newer than ours.
+void applyServerLimit(JsonVariantConst lim) {
+    if (lim.isNull()) return;
+    uint32_t rev = lim["rev"] | 0u;
+    if (rev <= cfg.limitRev) return;
+    int kph = lim["kph"] | cfg.defaultSpeedLimit;
+    const char* mode = lim["mode"] | "manual";
+    bool autoZ = strcmp(mode, "auto") == 0;
+    cfg.limitRev = rev;
+    setSpeedLimit(kph, autoZ);   // also persists limitRev
+    char l2[17];
+    snprintf(l2, sizeof(l2), "%d km/h %s", cfg.defaultSpeedLimit, autoZ ? "AUTO" : "SET");
+    showLcdMsg("Limit from srv", l2, 2500);
+    Serial.printf("[LIMIT] Applied server limit rev %u\n", (unsigned)rev);
+}
+
+void recordTrackPoint(float lat, float lon, float speed, float limit) {
+    if (fabsf(lat) < 0.0001f && fabsf(lon) < 0.0001f) return;
+    unsigned long now = millis();
+    unsigned long every = (speed >= PARKED_SPEED_KPH) ? TRACK_MOVING_MS : TRACK_PARKED_MS;
+    if (trackTotal > 0 && now - lastTrackMs < every) return;
+    lastTrackMs = now;
+
+    TrackPoint& p = trackBuf[trackHead];
+    p.lat = lat; p.lon = lon; p.speed = speed; p.limit = limit; p.ms = now;
+    trackHead = (trackHead + 1) % TRACK_BUF;
+    if (trackCount  < TRACK_BUF) trackCount++;
+    if (trackUnsent < TRACK_BUF) trackUnsent++;
+    trackTotal++;
+}
+
+// POSTs the oldest unsent points (up to TRACK_BATCH) to /api/track.
+bool uploadTrack() {
+    if (!state.wifiConnected || !state.internetOk || trackUnsent <= 0 ||
+        strlen(cfg.serverURL) < 10) return false;
+
+    int n = trackUnsent < TRACK_BATCH ? trackUnsent : TRACK_BATCH;
+    int start = (trackHead - trackUnsent + TRACK_BUF) % TRACK_BUF;
+    unsigned long now = millis();
+
+    DynamicJsonDocument doc(4096);
+    doc["device"]        = cfg.deviceID;
+    doc["limit_setting"] = cfg.defaultSpeedLimit;
+    doc["limit_mode"]    = cfg.autoZones ? "auto" : "manual";
+    doc["limit_rev"]     = cfg.limitRev;
+    if (strlen(cfg.apiKey) > 0) doc["api_key"] = cfg.apiKey;
+    JsonArray pts = doc.createNestedArray("points");
+    for (int i = 0; i < n; i++) {
+        const TrackPoint& p = trackBuf[(start + i) % TRACK_BUF];
+        JsonObject o = pts.createNestedObject();
+        o["lat"]   = serialized(String(p.lat, 6));
+        o["lon"]   = serialized(String(p.lon, 6));
+        o["speed"] = serialized(String(p.speed, 1));
+        o["limit"] = (int)p.limit;
+        o["age_s"] = (now - p.ms) / 1000UL;
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+    doc.clear();
+
+    HTTPClient http;
+    http.begin(serverBaseURL() + "/api/track");
+    addApiHeaders(http);
+    http.setTimeout(SERVER_TIMEOUT_MS);
+    int code = http.POST(payload);
+
+    bool ok = (code == 200 || code == 201);
+    if (ok) {
+        trackUnsent -= n;
+        if (trackUnsent < 0) trackUnsent = 0;
+        trackUploaded += n;
+        StaticJsonDocument<256> resp;
+        if (!deserializeJson(resp, http.getString()))
+            applyServerLimit(resp["limit"]);
+        Serial.printf("[TRACK] Uploaded %d pts (%d left)\n", n, trackUnsent);
+    } else {
+        Serial.printf("[TRACK] Upload HTTP %d\n", code);
     }
     http.end();
     return ok;
@@ -960,8 +1127,12 @@ void printWakeReason() {
 
 void enterDeepSleep() {
     flushPostQueue();
-    if (state.wifiConnected && state.internetOk)
+    if (state.wifiConnected && state.internetOk) {
+        // RAM track buffer is lost in deep sleep: push what we can first.
+        for (int i = 0; i < 3 && trackUnsent > 0; i++)
+            if (!uploadTrack()) break;
         sendHeartbeat();
+    }
 
     updateLCD("Parked sleep", "MENU to wake");
     Serial.printf("[SLEEP] Deep sleep %llu s (parked)\n", SLEEP_DURATION_US / 1000000ULL);
@@ -1022,9 +1193,12 @@ void logViolation(float speed, float limit, float lat, float lon, int tier) {
 //  LCD + UI RENDER
 // ═══════════════════════════════════════════════════════════
 void updateLCD(const char* line1, const char* line2) {
-    lcd.clear();
-    lcd.setCursor(0, 0); lcd.print(line1);
-    lcd.setCursor(0, 1); lcd.print(line2);
+    // Overwrite padded lines instead of lcd.clear(): no flicker on 1 s live refresh.
+    char b[17];
+    snprintf(b, sizeof(b), "%-16.16s", line1 ? line1 : "");
+    lcd.setCursor(0, 0); lcd.print(b);
+    snprintf(b, sizeof(b), "%-16.16s", line2 ? line2 : "");
+    lcd.setCursor(0, 1); lcd.print(b);
 }
 
 void truncate16(char* dest, const char* src) {
@@ -1054,12 +1228,13 @@ void renderStatusScreen(UiScreen screen) {
     memset(l2, ' ', 16); l2[16] = '\0';
 
     switch (screen) {
+        // Glyph 0 is written as \x08 (CGRAM alias): a literal \x00 would end the C string.
         case UI_SPEED: {
             if (state.gpsValid) {
-                snprintf(l1, sizeof(l1), "\x00 %3.0fkm/h L:%-3.0f",
+                snprintf(l1, sizeof(l1), "\x08 %3.0fkm/h L:%-3.0f",
                          state.currentSpeed, state.speedLimit);
             } else {
-                snprintf(l1, sizeof(l1), "\x00 Acquiring GPS");
+                snprintf(l1, sizeof(l1), "\x08 Acquiring GPS");
             }
 
             float excess = state.currentSpeed - state.speedLimit;
@@ -1083,6 +1258,20 @@ void renderStatusScreen(UiScreen screen) {
             }
             break;
         }
+        case UI_LIMIT: {
+            snprintf(l1, sizeof(l1), "Limit %3.0f %s",
+                     state.speedLimit, cfg.autoZones ? "AUTO" : "SET");
+            if (!state.gpsValid) {
+                snprintf(l2, sizeof(l2), "SCROLL = change");
+            } else {
+                float diff = state.currentSpeed - state.speedLimit;
+                if (diff > 0)
+                    snprintf(l2, sizeof(l2), "Now %3.0f OVER%3.0f", state.currentSpeed, diff);
+                else
+                    snprintf(l2, sizeof(l2), "Now %3.0f ok -%.0f", state.currentSpeed, -diff);
+            }
+            break;
+        }
         case UI_WIFI: {
             if (state.wifiConnected) {
                 char ssid[12];
@@ -1103,7 +1292,7 @@ void renderStatusScreen(UiScreen screen) {
         case UI_GPS: {
             int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
             float hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
-            snprintf(l1, sizeof(l1), "\x00 Sats:%-2d HDOP:%.1f", sats, hdop);
+            snprintf(l1, sizeof(l1), "\x08 Sats:%-2d HDOP:%.1f", sats, hdop);
             snprintf(l2, sizeof(l2), "Fix:%s %4.1fkm",
                      state.gpsValid ? "\x06 3D" : "NO", state.currentSpeed);
             break;
@@ -1163,106 +1352,191 @@ void renderUi(bool force) {
     if (state.uiPaused && now >= state.uiPauseUntil)
         state.uiPaused = false;
 
+    static unsigned long lastLiveMs = 0;
+    if (!force && (now < lcdHoldUntil || buttonHoldActive())) return;
     if (!state.uiPaused && (force || now - state.lastUiMs >= UI_ROTATE_MS)) {
         if (!force)
             state.uiScreen = (UiScreen)((state.uiScreen + 1) % UI_COUNT);
         state.lastUiMs = now;
+        lastLiveMs = now;
         renderStatusScreen(state.uiScreen);
     } else if (force) {
         state.lastUiMs = now;
+        lastLiveMs = now;
+        renderStatusScreen(state.uiScreen);
+    } else if (now - lastLiveMs >= 1000) {
+        lastLiveMs = now;
         renderStatusScreen(state.uiScreen);
     }
 }
 
 // ═══════════════════════════════════════════════════════════
-//  BUTTONS
-//  MENU short  → next status screen (pauses auto-rotate)
-//  MENU long   → enter Wi-Fi provisioning
-//  SCROLL short→ previous status screen
-//  SCROLL long → re-init GSM
+//  BUTTONS  (active-LOW: 10k pull-up to 3.3V, press pulls pin to GND)
+//  MENU   tap  → next screen (if the alarm is sounding: mute 60 s)
+//  MENU   hold → Wi-Fi setup hotspot (3 s, progress bar shown)
+//  SCROLL tap  → previous screen; on LIMIT screen: next limit preset
+//  SCROLL hold → re-init GSM modem (3 s, progress bar shown)
 // ═══════════════════════════════════════════════════════════
-void handleButtons() {
-    static unsigned long lastMenuEdge = 0, lastScrollEdge = 0;
-    static bool menuWasDown = false, scrollWasDown = false;
-    static unsigned long menuDownAt = 0, scrollDownAt = 0;
-    static bool menuLongDone = false, scrollLongDone = false;
+struct Button {
+    uint8_t pin;
+    bool    rawDown;
+    bool    down;              // debounced state
+    unsigned long rawAt;       // last raw level change
+    unsigned long downAt;
+    unsigned long upAt;
+    bool    longDone;
+    volatile bool          isrHit;
+    volatile unsigned long isrAt;
+};
+Button btnMenu   = { BTN_MENU };
+Button btnScroll = { BTN_SCROLL };
 
-    bool menuDown   = digitalRead(BTN_MENU) == LOW;
-    bool scrollDown = digitalRead(BTN_SCROLL) == LOW;
+enum BtnEvent : uint8_t { BTN_NONE, BTN_TAP, BTN_HOLD, BTN_CANCEL };
+
+void IRAM_ATTR isrMenu()   { btnMenu.isrHit = true;   btnMenu.isrAt = millis(); }
+void IRAM_ATTR isrScroll() { btnScroll.isrHit = true; btnScroll.isrAt = millis(); }
+
+void setupButtons() {
+    pinMode(BTN_MENU,   INPUT_PULLUP);
+    pinMode(BTN_SCROLL, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BTN_MENU),   isrMenu,   FALLING);
+    attachInterrupt(digitalPinToInterrupt(BTN_SCROLL), isrScroll, FALLING);
+}
+
+static BtnEvent pollButton(Button& b, unsigned long now) {
+    bool raw = digitalRead(b.pin) == LOW;
+    if (raw != b.rawDown) { b.rawDown = raw; b.rawAt = now; }
+
+    if (raw != b.down && now - b.rawAt >= BTN_DEBOUNCE_MS) {
+        b.down = raw;
+        b.isrHit = false;
+        if (b.down) {
+            b.downAt = now;
+            b.longDone = false;
+        } else {
+            b.upAt = now;
+            if (!b.longDone)
+                return (now - b.downAt < BTN_HOLD_HINT_MS) ? BTN_TAP : BTN_CANCEL;
+        }
+    }
+
+    if (b.down && !b.longDone && now - b.downAt >= BTN_LONG_MS) {
+        b.longDone = true;
+        return BTN_HOLD;
+    }
+
+    // Press and release both happened while loop() was blocked (SMS send, HTTP):
+    // the FALLING-edge ISR latched it, so it still counts as a tap.
+    if (!b.down && !raw && b.isrHit) {
+        unsigned long at = b.isrAt;
+        b.isrHit = false;
+        if ((long)(at - b.upAt) > 150) return BTN_TAP;
+    }
+    return BTN_NONE;
+}
+
+static bool inHoldHint(const Button& b, unsigned long now) {
+    return b.down && !b.longDone && now - b.downAt >= BTN_HOLD_HINT_MS;
+}
+
+bool buttonHoldActive() {
     unsigned long now = millis();
+    return inHoldHint(btnMenu, now) || inHoldHint(btnScroll, now);
+}
+
+static void drawHoldBar(const Button& b, const char* title, unsigned long now) {
+    static unsigned long lastDraw = 0;
+    if (!inHoldHint(b, now) || now - lastDraw < 100) return;
+    lastDraw = now;
+    unsigned long span = BTN_LONG_MS - BTN_HOLD_HINT_MS;
+    int filled = (int)(((now - b.downAt - BTN_HOLD_HINT_MS) * 16UL) / span);
+    if (filled > 16) filled = 16;
+    char bar[17];
+    for (int i = 0; i < 16; i++) bar[i] = (i < filled) ? '\x04' : '-';
+    bar[16] = '\0';
+    updateLCD(title, bar);
+}
+
+static void showLcdMsg(const char* l1, const char* l2, unsigned long ms) {
+    updateLCD(l1, l2);
+    lcdHoldUntil = millis() + ms;
+}
+
+static void showScreen(UiScreen sc) {
+    unsigned long now = millis();
+    state.uiScreen = sc;
+    state.uiPaused = true;
+    state.uiPauseUntil = now + UI_PAUSE_MS;
+    state.lastUiMs = now;
+    lcdHoldUntil = 0;
+    renderStatusScreen(sc);
+}
+
+static void cycleLimitPreset() {
+    static const int PRESETS[] = { 30, 40, 50, 60, 70, 80, 100, 120 };
+    const int n = sizeof(PRESETS) / sizeof(PRESETS[0]);
+    if (cfg.autoZones) {
+        setSpeedLimit(PRESETS[0], false);
+    } else {
+        int next = -1;
+        for (int i = 0; i < n; i++)
+            if (PRESETS[i] > cfg.defaultSpeedLimit) { next = PRESETS[i]; break; }
+        if (next < 0) setSpeedLimit(DEFAULT_SPEED_LIMIT, true);   // past 120 → AUTO zones
+        else          setSpeedLimit(next, false);
+    }
+    showScreen(UI_LIMIT);
+}
+
+void handleButtons() {
+    unsigned long now = millis();
+    BtnEvent m = pollButton(btnMenu, now);
+    BtnEvent s = pollButton(btnScroll, now);
+    bool prov = state.mode == MODE_PROVISIONING;
+
+    drawHoldBar(btnMenu,   "Hold: WiFi setup", now);
+    drawHoldBar(btnScroll, "Hold: GSM reset",  now);
 
     // ── MENU ─────────────────────────────────────────────────
-    if (menuDown && !menuWasDown && now - lastMenuEdge > BTN_DEBOUNCE_MS) {
-        menuWasDown = true;
-        menuDownAt = now;
-        menuLongDone = false;
-        lastMenuEdge = now;
-    }
-    if (menuDown && menuWasDown && !menuLongDone && now - menuDownAt >= BTN_LONG_MS) {
-        menuLongDone = true;
+    if (m == BTN_TAP) {
+        if (state.violationTier > 0 && now >= state.buzzerMuteUntilMs) {
+            state.buzzerMuteUntilMs = now + 60000;
+            silenceAlert();
+            showLcdMsg("Alarm muted", "for 60 seconds", 2000);
+        } else if (prov) {
+            state.provPage++;
+            state.lastUiMs = 0;
+            renderUi(true);
+        } else {
+            showScreen((UiScreen)((state.uiScreen + 1) % UI_COUNT));
+        }
+    } else if (m == BTN_HOLD) {
         enterProvisioning("MENU hold");
         updateLCD("WiFi Setup...", "Starting AP");
         startProvisioningAP();
         state.provPage = 0;
         state.lastUiMs = 0;
         renderUi(true);
-    }
-    if (!menuDown && menuWasDown) {
-        menuWasDown = false;
-        if (!menuLongDone && now - menuDownAt < BTN_LONG_MS) {
-            if (state.violationTier > 0) {
-                state.buzzerMuteUntilMs = now + 60000;
-                silenceAlert();
-                updateLCD("Alert Silenced", "Buzzer Muted 60s");
-                state.uiPaused = true;
-                state.uiPauseUntil = now + 2500;
-                state.lastUiMs = now;
-            } else if (state.mode == MODE_PROVISIONING) {
-                state.provPage++;
-                state.lastUiMs = 0;
-                renderUi(true);
-            } else {
-                state.uiScreen = (UiScreen)((state.uiScreen + 1) % UI_COUNT);
-                state.uiPaused = true;
-                state.uiPauseUntil = now + UI_PAUSE_MS;
-                state.lastUiMs = now;
-                renderStatusScreen(state.uiScreen);
-            }
-        }
+    } else if (m == BTN_CANCEL) {
+        if (prov) renderUi(true); else showScreen(state.uiScreen);
     }
 
     // ── SCROLL ───────────────────────────────────────────────
-    if (scrollDown && !scrollWasDown && now - lastScrollEdge > BTN_DEBOUNCE_MS) {
-        scrollWasDown = true;
-        scrollDownAt = now;
-        scrollLongDone = false;
-        lastScrollEdge = now;
-    }
-    if (scrollDown && scrollWasDown && !scrollLongDone && now - scrollDownAt >= BTN_LONG_MS) {
-        scrollLongDone = true;
-        updateLCD("Re-init GSM...", "");
-        state.gsmReady = initGSM();
-        updateLCD("GSM:", state.gsmReady ? "OK" : "FAILED");
-        state.uiPaused = true;
-        state.uiPauseUntil = now + UI_PAUSE_MS;
-        state.lastUiMs = now;
-    }
-    if (!scrollDown && scrollWasDown) {
-        scrollWasDown = false;
-        if (!scrollLongDone && now - scrollDownAt < BTN_LONG_MS) {
-            if (state.mode == MODE_PROVISIONING) {
-                // Show password / IP page immediately
-                state.provPage = 2;
-                state.lastUiMs = 0;
-                renderUi(true);
-            } else {
-                state.uiScreen = (UiScreen)((state.uiScreen + UI_COUNT - 1) % UI_COUNT);
-                state.uiPaused = true;
-                state.uiPauseUntil = now + UI_PAUSE_MS;
-                state.lastUiMs = now;
-                renderStatusScreen(state.uiScreen);
-            }
+    if (s == BTN_TAP) {
+        if (prov) {
+            state.provPage = 2;          // password / IP page
+            state.lastUiMs = 0;
+            renderUi(true);
+        } else if (state.uiScreen == UI_LIMIT) {
+            cycleLimitPreset();
+        } else {
+            showScreen((UiScreen)((state.uiScreen + UI_COUNT - 1) % UI_COUNT));
         }
+    } else if (s == BTN_HOLD) {
+        updateLCD("Re-init GSM...", "please wait");
+        state.gsmReady = initGSM();
+        showLcdMsg("GSM modem:", state.gsmReady ? "Ready \x06" : "FAILED", 2500);
+    } else if (s == BTN_CANCEL) {
+        if (prov) renderUi(true); else showScreen(state.uiScreen);
     }
 }
 
@@ -1459,6 +1733,8 @@ void loadConfig() {
         state.sleepEnabled = prefs.getBool("sleepEn");
 
     if (prefs.isKey("defLimit"))    cfg.defaultSpeedLimit = prefs.getInt("defLimit");
+    if (prefs.isKey("autoZones"))   cfg.autoZones         = prefs.getBool("autoZones");
+    if (prefs.isKey("limitRev"))    cfg.limitRev          = prefs.getUInt("limitRev");
     if (prefs.isKey("thrMinor"))    cfg.threshMinor       = prefs.getInt("thrMinor");
     if (prefs.isKey("thrModerate")) cfg.threshModerate    = prefs.getInt("thrModerate");
     if (prefs.isKey("thrSevere"))   cfg.threshSevere      = prefs.getInt("thrSevere");
@@ -1515,6 +1791,8 @@ void saveConfig() {
     prefs.putString("apiKey",    cfg.apiKey);
     prefs.putBool("sleepEn",     state.sleepEnabled);
     prefs.putInt("defLimit",     cfg.defaultSpeedLimit);
+    prefs.putBool("autoZones",   cfg.autoZones);
+    prefs.putUInt("limitRev",    cfg.limitRev);
     prefs.putInt("thrMinor",     cfg.threshMinor);
     prefs.putInt("thrModerate",  cfg.threshModerate);
     prefs.putInt("thrSevere",    cfg.threshSevere);
@@ -1644,6 +1922,14 @@ button:active,.btn:active{transform:scale(.95);filter:brightness(.88)}
 .flash{animation:flash .5s ease}
 @keyframes flash{0%{box-shadow:0 0 0 0 rgba(15,157,138,.55)}100%{box-shadow:0 0 0 10px rgba(15,157,138,0)}}
 .target{font-size:.82rem;color:var(--soft);margin-top:8px}.target b{color:var(--td)}
+.chkline{display:flex;align-items:baseline;gap:6px}
+.chkline .big{font:700 2.3rem monospace;line-height:1}.chkline .sep{font-size:1.6rem;color:var(--mut)}
+.lbar{height:10px;background:#eef2f6;border-radius:99px;overflow:hidden;margin:10px 0 2px}
+.lbar div{height:100%;width:0;background:var(--teal);transition:width .4s ease,background .3s}
+.limset{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.limset input[type=number]{width:110px;flex:0 0 110px;text-align:center;font:600 1.15rem monospace}
+.limset .btn{margin:0}
+.step{border:1px solid var(--line);background:#f7fafc;border-radius:10px;min-width:52px;min-height:48px;font:600 1rem monospace;cursor:pointer;color:var(--ink)}
 .cnt{font:500 .72rem monospace;color:var(--mut);float:right}
 .quick{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
 .quick button{border:1px solid var(--line);background:#f7fafc;border-radius:8px;padding:7px 10px;font-size:.75rem;cursor:pointer;color:var(--soft)}
@@ -1730,6 +2016,8 @@ function updateLive(){
     if(sysGps) sysGps.className = 'dot ' + (gpsOk ? 'dok' : 'dwrn');
     var sysIp = document.getElementById('sysIp'); if(sysIp) sysIp.textContent = 'IP ' + (d.ip || '0.0.0.0');
     var sysHeap = document.getElementById('sysHeap'); if(sysHeap) sysHeap.textContent = 'Heap ' + (d.free_heap || 0) + ' B';
+    updateLimit(d);
+    updateLoc(d);
 
     if(viols !== lastViolTotal){
       lastViolTotal = viols;
@@ -1759,22 +2047,109 @@ function updateViolations(){
         '<td class="mono"><b>' + Math.round(r.speed) + '</b> <span class="u">km/h</span></td>' +
         '<td class="mono">' + Math.round(r.limit) + '</td>' +
         '<td class="mono" style="color:var(--rose)">+' + excess + '</td>' +
-        '<td class="mono" style="font-size:.75rem">' + (r.lat ? r.lat.toFixed(4) + ', ' + r.lon.toFixed(4) : 'No GPS') + '</td></tr>';
+        '<td class="mono" style="font-size:.75rem">' + (r.lat ? '<a href="' + gmUrl(r.lat, r.lon) + '" target=_blank rel=noopener>' + r.lat.toFixed(4) + ', ' + r.lon.toFixed(4) + ' &#8599;</a>' : 'No GPS') + '</td></tr>';
     }
     h += '</tbody></table></div>';
     box.innerHTML = h;
   }).catch(function(){});
 }
 
+function gmUrl(lat, lon){ return 'https://www.google.com/maps/search/?api=1&query=' + (+lat).toFixed(6) + ',' + (+lon).toFixed(6); }
+function updateLoc(d){
+  var ok = d.lat !== undefined && d.lon !== undefined;
+  var c = gid('locCoords'), a = gid('locGmaps'), f = gid('locFix'), t = gid('trkInfo');
+  if(c) c.textContent = ok ? (+d.lat).toFixed(6) + ', ' + (+d.lon).toFixed(6) : 'Waiting for GPS fix';
+  if(a){ a.style.display = ok ? '' : 'none'; if(ok) a.href = gmUrl(d.lat, d.lon); }
+  if(f) f.textContent = !ok ? 'No fix' : (d.gps_valid ? 'Live fix' : 'Last known');
+  if(t) t.textContent = 'GPS log: ' + (d.track_points || 0) + ' in memory · ' + (d.track_uploaded || 0) +
+    ' uploaded · ' + (d.track_unsent || 0) + ' waiting' + (d.internet_ok ? '' : ' (no internet)');
+}
+function updateTrack(){
+  fetch('/api/track').then(function(r){return r.json();}).then(function(res){
+    var p = res.points || [], a = gid('trkGmaps');
+    if(!a) return;
+    if(p.length < 2){ a.style.display = 'none'; return; }
+    var n = Math.min(10, p.length), parts = [];
+    for(var i = 0; i < n; i++){
+      var q = p[Math.round(i * (p.length - 1) / (n - 1))];
+      parts.push(q.lat.toFixed(6) + ',' + q.lon.toFixed(6));
+    }
+    a.href = 'https://www.google.com/maps/dir/' + parts.join('/');
+    a.style.display = '';
+  }).catch(function(){});
+}
+
 setInterval(updateLive, 1000);
+setInterval(updateTrack, 15000);
 updateLive();
 updateViolations();
+updateTrack();
 
 function muteBuzzer(){
   fetch('/api/mute',{method:'POST'}).then(function(r){return r.json();}).then(function(){alert('Buzzer muted for 60s');}).catch(function(){});
 }
 function toggleHUD(){
   document.body.classList.toggle('hud-mode');
+}
+
+var limDirty = false;
+function gid(i){ return document.getElementById(i); }
+function limStatus(t, c){ var e = gid('limStatus'); if(e){ e.className = 'statusline ' + (c || ''); e.textContent = t || ''; } }
+function markPreset(v, mode){
+  var bs = document.querySelectorAll('#limPresets button');
+  for(var i = 0; i < bs.length; i++)
+    bs[i].classList.toggle('on', mode !== 'auto' && parseInt(bs[i].getAttribute('data-v'), 10) === v);
+}
+function updateLimit(d){
+  var spd = Math.round(d.speed || 0), lim = Math.round(d.speed_limit || 0), gpsOk = !!d.gps_valid;
+  var s = gid('chkSpd'), l = gid('chkLim'), bar = gid('chkBar'), st = gid('chkState'), pill = gid('limModePill');
+  if(!s) return;
+  s.textContent = spd; l.textContent = lim;
+  var pct = lim > 0 ? Math.min(100, spd / lim * 100) : 0;
+  bar.style.width = pct + '%';
+  bar.style.background = spd > lim ? 'var(--rose)' : (pct > 85 ? 'var(--amber)' : 'var(--teal)');
+  if(!gpsOk){ st.className = 'statusline'; st.textContent = 'Waiting for GPS fix — the check starts when GPS locks'; }
+  else if(spd > lim){ st.className = 'statusline err'; st.textContent = 'OVER the limit by ' + (spd - lim) + ' km/h' + (d.alarm_muted ? ' (alarm muted)' : ''); }
+  else { st.className = 'statusline ok'; st.textContent = 'Within limit — ' + (lim - spd) + ' km/h below'; }
+  pill.textContent = d.limit_mode === 'auto' ? 'AUTO zones' : 'MANUAL';
+  if(!limDirty){
+    gid('limIn').value = d.limit_setting;
+    gid('limAuto').checked = d.limit_mode === 'auto';
+    markPreset(d.limit_setting, d.limit_mode);
+  }
+}
+function stepLim(delta){
+  var inp = gid('limIn'), v = parseInt(inp.value, 10) || 50;
+  v = Math.max(5, Math.min(250, v + delta));
+  inp.value = v; limDirty = true; markPreset(v, 'manual');
+  limStatus('Tap "Set limit" to apply ' + v + ' km/h', '');
+}
+function presetLim(b){
+  gid('limIn').value = b.getAttribute('data-v');
+  gid('limAuto').checked = false;
+  saveLim(gid('limSave'));
+}
+function saveLim(btn){
+  var v = parseInt(gid('limIn').value, 10), auto = gid('limAuto').checked;
+  if(!(v >= 5 && v <= 250)){ limStatus('Enter a limit between 5 and 250 km/h', 'err'); return; }
+  if(btn){ btn.classList.add('busy'); btn.disabled = true; }
+  limStatus('Saving…', 'busy');
+  fetch('/api/limit', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'limit=' + v + '&mode=' + (auto ? 'auto' : 'manual')})
+  .then(function(r){ return r.json(); }).then(function(d){
+    if(btn){ btn.classList.remove('busy'); btn.disabled = false; }
+    if(!d.ok){ limStatus(d.detail || 'Could not save', 'err'); return; }
+    limDirty = false;
+    gid('chkLim').textContent = Math.round(d.speed_limit);
+    gid('kpiLim') && (gid('kpiLim').textContent = Math.round(d.speed_limit));
+    markPreset(d.limit_setting, d.limit_mode);
+    limStatus(d.limit_mode === 'auto'
+      ? 'AUTO: map zone limits apply (' + d.limit_setting + ' km/h outside zones)'
+      : 'Speed limit set to ' + d.limit_setting + ' km/h', 'ok');
+  }).catch(function(){
+    if(btn){ btn.classList.remove('busy'); btn.disabled = false; }
+    limStatus('No response from device', 'err');
+  });
 }
 </script>
 )JS";
@@ -1997,7 +2372,7 @@ void sendDashboard() {
         webServer.sendContent(cfg.deviceID);
         webServer.sendContent(F(" · session desk</p><div class='chips'>"));
 
-        char chip[160];
+        char chip[256];
         snprintf(chip, sizeof(chip),
             "<span class='chip' id='chipMode'>%s</span>"
             "<span class='chip%s' id='chipNet'>%s</span>"
@@ -2027,7 +2402,60 @@ void sendDashboard() {
         "<div class='row' style='justify-content:center;margin-top:6px'>"
         "<button type=button class='btn bp' onclick=muteBuzzer()>Mute Buzzer (60s)</button>"
         "<button type=button class='btn bg' onclick=toggleHUD()>HUD Mode</button>"
-        "</div></div></div>"));
+        "</div></div>"));
+
+    // Speed limit: live check + set
+    {
+        char buf[1800];
+        snprintf(buf, sizeof(buf),
+            "<div class='panel' id=limitCard><div class='phd'><h3>Speed limit check</h3>"
+            "<span class='pill' id=limModePill>%s</span></div><div class='pbd'>"
+            "<div class=chkline><span class=big id=chkSpd>%d</span><span class=sep>/</span>"
+            "<span class=big id=chkLim>%d</span><span class=u>km/h</span></div>"
+            "<div class=lbar><div id=chkBar></div></div>"
+            "<div class=statusline id=chkState>%s</div>"
+            "<label for=limIn>Set speed limit (km/h)</label>"
+            "<div class=limset>"
+            "<button type=button class=step onclick=stepLim(-5)>&minus;5</button>"
+            "<input id=limIn type=number min=5 max=250 value=%d oninput='limDirty=true'>"
+            "<button type=button class=step onclick=stepLim(5)>+5</button>"
+            "<button type=button class='btn bp' id=limSave onclick=saveLim(this)>Set limit</button>"
+            "</div>"
+            "<div class=quick id=limPresets>"
+            "<button type=button data-v=30 onclick=presetLim(this)>30</button>"
+            "<button type=button data-v=40 onclick=presetLim(this)>40</button>"
+            "<button type=button data-v=50 onclick=presetLim(this)>50</button>"
+            "<button type=button data-v=60 onclick=presetLim(this)>60</button>"
+            "<button type=button data-v=80 onclick=presetLim(this)>80</button>"
+            "<button type=button data-v=100 onclick=presetLim(this)>100</button>"
+            "<button type=button data-v=120 onclick=presetLim(this)>120</button>"
+            "</div>"
+            "<label class=chk><input type=checkbox id=limAuto%s onchange=saveLim(null)>"
+            "<span>AUTO: use map zone limits where available</span></label>"
+            "<div class=statusline id=limStatus></div>"
+            "</div></div>",
+            cfg.autoZones ? "AUTO zones" : "MANUAL",
+            (int)state.currentSpeed, (int)state.speedLimit,
+            state.gpsValid ? "Checking…" : "Waiting for GPS fix — the check starts when GPS locks",
+            cfg.defaultSpeedLimit,
+            cfg.autoZones ? " checked" : "");
+        webServer.sendContent(buf);
+    }
+
+    // Location + GPS log (filled by updateLoc / updateTrack)
+    webServer.sendContent(F(
+        "<div class='panel' id=locCard><div class='phd'><h3>Location</h3>"
+        "<span class='pill' id=locFix>No fix</span></div><div class='pbd'>"
+        "<div class=mono id=locCoords style='font-size:1.05rem'>Waiting for GPS fix</div>"
+        "<div class=row style='margin-top:10px'>"
+        "<a class='btn bp' id=locGmaps href='#' target=_blank rel=noopener style='display:none'>Open in Google Maps</a>"
+        "<a class='btn bg' id=trkGmaps href='#' target=_blank rel=noopener style='display:none'>Recent route in Google Maps</a>"
+        "</div>"
+        "<div class=statusline id=trkInfo>GPS log: waiting for a fix</div>"
+        "<p class=hint style='margin:6px 0 0'>A point is logged every 5 s while moving (60 s parked) "
+        "and uploaded to the server every 15 s when online.</p>"
+        "</div></div>"));
+    webServer.sendContent(F("</div>"));
 
     // Secondary column: Diagnostics & Hardware Bench & Recipients
     webServer.sendContent(F("<div class='dash-col side-cockpit'>"));
@@ -2061,6 +2489,21 @@ void sendDashboard() {
         "<button type=button class='btn bg' onclick=\"fetch('/api/test/leds',{method:'POST'}).then(()=>alert('Cycled LEDs!'))\">Cycle LEDs</button>"
         "<button type=button class='btn bg' onclick=\"fetch('/api/test/lcd',{method:'POST'}).then(()=>alert('Blinked LCD!'))\">Blink LCD</button>"
         "</div></div></div>"));
+
+    // Physical button guide
+    webServer.sendContent(F(
+        "<div class='panel'><div class='phd'><h3>Device buttons</h3></div>"
+        "<div class=table-wrap><table>"
+        "<thead><tr><th>Button</th><th>Tap</th><th>Hold 3 s</th></tr></thead><tbody>"
+        "<tr><td><b>MENU</b><br><span class=u>GPIO 18</span></td>"
+        "<td>Next screen<br><span class=u>mutes alarm 60 s while it sounds</span></td>"
+        "<td>Wi-Fi setup hotspot</td></tr>"
+        "<tr><td><b>SCROLL</b><br><span class=u>GPIO 19</span></td>"
+        "<td>Previous screen<br><span class=u>on the Limit screen: next limit 30→120→AUTO</span></td>"
+        "<td>Restart GSM modem</td></tr>"
+        "</tbody></table></div>"
+        "<div class=pbd><p class=hint style='margin:0'>LCD screens: Speed → Limit → Wi-Fi → GPS → Stats. "
+        "While you hold a button a bar fills on the LCD; let go early to cancel.</p></div></div>"));
 
     // SMS recipients card
     webServer.sendContent(F("<div class='panel'><div class='phd'><h3>SMS recipients</h3>"
@@ -2118,17 +2561,19 @@ void sendDashboard() {
         for (int i = logCount - 1; i >= 0; i--) {
             int idx = (start + i) % LOG_SIZE;
             ViolationRecord& r = violationLog[idx];
-            char row[360];
+            char row[600];
             snprintf(row, sizeof(row),
                 "<tr><td class='mono'>%d</td>"
                 "<td><span class='tier-tag tier-%s'>%s</span></td>"
                 "<td class='mono'><b>%d</b> <span class='u'>km/h</span></td>"
                 "<td class='mono'>%d</td>"
                 "<td class='mono' style='color:var(--rose)'>+%d</td>"
-                "<td class='mono' style='font-size:.75rem'>%.4f, %.4f</td></tr>",
+                "<td class='mono' style='font-size:.75rem'>"
+                "<a href='https://www.google.com/maps/search/?api=1&amp;query=%.6f,%.6f' target=_blank rel=noopener>"
+                "%.4f, %.4f &#8599;</a></td></tr>",
                 logCount - i, r.tier_str, r.tier_str,
                 (int)r.speed, (int)r.limit, (int)(r.speed - r.limit),
-                r.lat, r.lon);
+                r.lat, r.lon, r.lat, r.lon);
             webServer.sendContent(row);
         }
         webServer.sendContent(F("</tbody></table></div>"));
@@ -2214,11 +2659,13 @@ void sendSettings() {
 
     // Thresholds
     {
-        char buf[640];
+        char buf[960];
         snprintf(buf, sizeof(buf),
-            "<div class='fs'><h2>Speed thresholds</h2>"
-            "<label>Default speed limit (km/h)</label>"
-            "<input name='defLimit' type='number' value='%d' min='10' max='200'>"
+            "<div class='fs'><h2>Speed limit &amp; thresholds</h2>"
+            "<label>Speed limit (km/h)</label>"
+            "<input name='defLimit' type='number' value='%d' min='5' max='250'>"
+            "<label class=chk><input name=autoZones type=checkbox value=1%s>"
+            "<span>Use map zone limits (AUTO) where available — otherwise the limit above always applies</span></label>"
             "<label>Minor (km/h over)</label>"
             "<input name='thrMinor' type='number' value='%d' min='1' max='50'>"
             "<label>Moderate (km/h over)</label>"
@@ -2226,7 +2673,8 @@ void sendSettings() {
             "<label>Severe + SMS (km/h over)</label>"
             "<input name='thrSevere' type='number' value='%d' min='1' max='100'>"
             "</div>",
-            cfg.defaultSpeedLimit, cfg.threshMinor, cfg.threshModerate, cfg.threshSevere);
+            cfg.defaultSpeedLimit, cfg.autoZones ? " checked" : "",
+            cfg.threshMinor, cfg.threshModerate, cfg.threshSevere);
         webServer.sendContent(buf);
     }
 
@@ -2438,10 +2886,13 @@ void sendSmsTest() {
 
 // ── Status JSON ───────────────────────────────────────────────
 void sendStatusJSON() {
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<1152> doc;
     doc["device"]           = cfg.deviceID;
     doc["speed"]            = state.currentSpeed;
     doc["speed_limit"]      = state.speedLimit;
+    doc["limit_setting"]    = cfg.defaultSpeedLimit;
+    doc["limit_mode"]       = cfg.autoZones ? "auto" : "manual";
+    doc["alarm_muted"]      = millis() < state.buzzerMuteUntilMs;
     doc["violation_tier"]   = state.violationTier;
     doc["gps_valid"]        = state.gpsValid;
     doc["wifi_connected"]   = state.wifiConnected;
@@ -2460,8 +2911,18 @@ void sendStatusJSON() {
     doc["geofence_version"] = state.geofenceVersion;
     if (gps.satellites.isValid()) doc["satellites"] = gps.satellites.value();
     if (gps.hdop.isValid())       doc["hdop"]       = gps.hdop.hdop();
+    if (gps.location.isValid()) {
+        doc["lat"]   = serialized(String(gps.location.lat(), 6));
+        doc["lon"]   = serialized(String(gps.location.lng(), 6));
+        doc["fix_age_ms"] = gps.location.age();
+    }
+    doc["limit_rev"]      = cfg.limitRev;
+    doc["track_points"]   = trackCount;
+    doc["track_unsent"]   = trackUnsent;
+    doc["track_total"]    = trackTotal;
+    doc["track_uploaded"] = trackUploaded;
     String out;
-    out.reserve(400);
+    out.reserve(700);
     serializeJsonPretty(doc, out);
     webServer.sendHeader("Access-Control-Allow-Origin", "*");
     webServer.send(200, "application/json", out);
@@ -2488,6 +2949,30 @@ void sendViolationsJSON() {
     }
     char tail[40];
     snprintf(tail, sizeof(tail), "],\"total\":%d}", logCount);
+    webServer.sendContent(tail);
+    webServer.sendContent("");
+}
+
+// ── GPS track JSON (RAM buffer, oldest → newest) ─────────────
+void sendTrackJSON() {
+    webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    webServer.sendHeader("Access-Control-Allow-Origin", "*");
+    webServer.send(200, "application/json", "");
+    webServer.sendContent(F("{\"points\":["));
+    unsigned long now = millis();
+    int startIdx = (trackHead - trackCount + TRACK_BUF) % TRACK_BUF;
+    for (int i = 0; i < trackCount; i++) {
+        const TrackPoint& p = trackBuf[(startIdx + i) % TRACK_BUF];
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "%s{\"lat\":%.6f,\"lon\":%.6f,\"speed\":%.1f,\"limit\":%.0f,\"age_s\":%lu,\"sent\":%s}",
+            i ? "," : "", p.lat, p.lon, p.speed, p.limit, (now - p.ms) / 1000UL,
+            i < trackCount - trackUnsent ? "true" : "false");
+        webServer.sendContent(buf);
+    }
+    char tail[96];
+    snprintf(tail, sizeof(tail), "],\"count\":%d,\"unsent\":%d,\"total\":%lu,\"uploaded\":%lu}",
+             trackCount, trackUnsent, trackTotal, trackUploaded);
     webServer.sendContent(tail);
     webServer.sendContent("");
 }
@@ -2598,6 +3083,26 @@ void setupWebServer() {
         webServer.send(200, F("application/json"), out);
     });
 
+    webServer.on("/api/limit", HTTP_POST, []() {
+        int kph = webServer.hasArg("limit") ? webServer.arg("limit").toInt() : cfg.defaultSpeedLimit;
+        bool autoZ = webServer.hasArg("mode") ? webServer.arg("mode") == "auto" : cfg.autoZones;
+        if (kph < 5 || kph > 250) {
+            webServer.send(400, F("application/json"),
+                F("{\"ok\":false,\"detail\":\"Limit must be 5-250 km/h\"}"));
+            return;
+        }
+        setSpeedLimit(kph, autoZ);
+        if (state.uiScreen == UI_LIMIT) renderUi(true);
+        StaticJsonDocument<160> doc;
+        doc["ok"] = true;
+        doc["limit_setting"] = cfg.defaultSpeedLimit;
+        doc["limit_mode"] = cfg.autoZones ? "auto" : "manual";
+        doc["speed_limit"] = state.speedLimit;
+        String out;
+        serializeJson(doc, out);
+        webServer.send(200, F("application/json"), out);
+    });
+
     webServer.on("/api/gsm-reinit", HTTP_POST, []() {
         state.gsmReady = initGSM();
         StaticJsonDocument<128> doc;
@@ -2651,8 +3156,13 @@ void setupWebServer() {
             cfg.apiKey[47] = '\0';
         }
         state.sleepEnabled = webServer.hasArg("sleepEn");
-        if (webServer.hasArg("defLimit"))
-            cfg.defaultSpeedLimit = webServer.arg("defLimit").toInt();
+        if (webServer.hasArg("defLimit")) {
+            int v = webServer.arg("defLimit").toInt();
+            if (v >= 5 && v <= 250) cfg.defaultSpeedLimit = v;
+        }
+        cfg.autoZones = webServer.hasArg("autoZones");
+        state.speedLimit = state.gpsValid ? getSpeedLimit(state.prevLat, state.prevLon)
+                                          : (float)cfg.defaultSpeedLimit;
         if (webServer.hasArg("thrMinor"))
             cfg.threshMinor = webServer.arg("thrMinor").toInt();
         if (webServer.hasArg("thrModerate"))
@@ -2696,6 +3206,7 @@ void setupWebServer() {
 
     webServer.on("/api/status",     HTTP_GET, sendStatusJSON);
     webServer.on("/api/violations", HTTP_GET, sendViolationsJSON);
+    webServer.on("/api/track",      HTTP_GET, sendTrackJSON);
     webServer.on("/api/scan",       HTTP_GET, sendWifiScanJSON);
 
     webServer.on("/test-sms", HTTP_GET, []() {
