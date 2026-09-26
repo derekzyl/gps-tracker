@@ -42,6 +42,7 @@
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <qrcode.h>
 
 // ═══════════════════════════════════════════════════════════
@@ -49,7 +50,8 @@
 // ═══════════════════════════════════════════════════════════
 #define PIN_BUZZER       25
 #define PIN_LED_RED      25
-// Red LED + buzzer on GPIO 25 sound when the pin is driven HIGH.
+// GPIO 25 → transistor → 555 alarm stage. Measured on the hardware: HIGH sounds the
+// alarm, LOW silences it. Held at ALARM_OFF through deep sleep.
 #define ALARM_ON         HIGH
 #define ALARM_OFF        LOW
 #define PIN_LED_YELLOW   26
@@ -165,6 +167,7 @@ struct SystemState {
     bool    gsmReady       = false;
     bool    wifiConfigured = false;  // NVS has user Wi-Fi
 
+
     DeviceMode mode        = MODE_PROVISIONING;
     UiScreen   uiScreen    = UI_SPEED;
     bool       uiPaused    = false;
@@ -256,6 +259,9 @@ bool blinkState = false;
 // Transient LCD message (e.g. "Alarm muted") protected from the live refresh until this time.
 unsigned long lcdHoldUntil = 0;
 
+// Diagnostic: GPIO 25 forced to a fixed level until this time, then back to ALARM_OFF.
+unsigned long pinTestUntilMs = 0;
+
 // ═══════════════════════════════════════════════════════════
 //  FORWARD DECLARATIONS
 // ═══════════════════════════════════════════════════════════
@@ -342,6 +348,13 @@ void initLcdGlyphs() {
 }
 
 void setup() {
+    // Silence the alarm first. After deep sleep the pin is still held OFF; configure
+    // the output before releasing the hold so it never floats.
+    digitalWrite(PIN_BUZZER, ALARM_OFF);
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, ALARM_OFF);
+    gpio_hold_dis((gpio_num_t)PIN_BUZZER);
+
     Serial.begin(115200);
     delay(50);
     Serial.println(F("\n=== Velocis Firmware v1.4 — System Starting ==="));
@@ -349,8 +362,6 @@ void setup() {
 
     memset(postQueue, 0, sizeof(postQueue));
 
-    digitalWrite(PIN_LED_RED, ALARM_OFF);   // latch OFF before enabling output: no chirp at boot
-    pinMode(PIN_LED_RED,    OUTPUT);
     pinMode(PIN_LED_YELLOW, OUTPUT);
     pinMode(PIN_LED_GREEN,  OUTPUT);
     pinMode(BTN_MENU,       INPUT_PULLUP);
@@ -433,8 +444,14 @@ void loop() {
         Serial.println(F("[GPS]  Fix lost"));
     }
 
+    if (pinTestUntilMs && (long)(now - pinTestUntilMs) >= 0) {
+        pinTestUntilMs = 0;
+        digitalWrite(PIN_BUZZER, ALARM_OFF);
+        Serial.printf("[TEST] GPIO25 back to ALARM_OFF (%s)\n", ALARM_OFF == HIGH ? "HIGH" : "LOW");
+    }
+
     // Alarm blink cadence (200–500 ms) needs a faster tick than 1 Hz GPS fixes.
-    if (state.gpsValid && state.violationTier > 0)
+    if (!pinTestUntilMs && state.gpsValid && state.violationTier > 0)
         triggerAlert(state.violationTier);
     if (state.wifiConnected && state.internetOk) {
         if (now - state.lastHeartbeatMs >= HEARTBEAT_MS) {
@@ -1141,6 +1158,11 @@ void enterDeepSleep() {
     lcd.noBacklight();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+
+    // Keep the alarm pin driven OFF through deep sleep (pins float otherwise → 555 sounds).
+    digitalWrite(PIN_BUZZER, ALARM_OFF);
+    gpio_hold_en((gpio_num_t)PIN_BUZZER);
+    gpio_deep_sleep_hold_en();
 
     esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
     // MENU (GPIO18) LOW wakes — INPUT_PULLUP, wake on low
@@ -2488,6 +2510,8 @@ void sendDashboard() {
         "<button type=button class='btn bg' onclick=\"fetch('/api/test/buzzer',{method:'POST'}).then(()=>alert('Buzzer pulsed!'))\">Test Buzzer</button>"
         "<button type=button class='btn bg' onclick=\"fetch('/api/test/leds',{method:'POST'}).then(()=>alert('Cycled LEDs!'))\">Cycle LEDs</button>"
         "<button type=button class='btn bg' onclick=\"fetch('/api/test/lcd',{method:'POST'}).then(()=>alert('Blinked LCD!'))\">Blink LCD</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/pin25?level=1',{method:'POST'})\">GPIO25 HIGH 5 s</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/pin25?level=0',{method:'POST'})\">GPIO25 LOW 5 s</button>"
         "</div></div></div>"));
 
     // Physical button guide
@@ -2642,6 +2666,8 @@ void sendSettings() {
         "<button type=button class='btn bg' onclick=\"fetch('/api/test/leds',{method:'POST'}).then(()=>alert('Cycled LEDs!'))\">Cycle LEDs (G/Y/R)</button>"
         "<button type=button class='btn bg' onclick=\"fetch('/api/test/lcd',{method:'POST'}).then(()=>alert('Cycled LCD backlight!'))\">Blink LCD</button>"
         "<button type=button class='btn bg' onclick=\"fetch('/api/mute',{method:'POST'}).then(()=>alert('Buzzer muted 60s!'))\">Mute Buzzer (60s)</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/pin25?level=1',{method:'POST'})\">GPIO25 HIGH 5 s</button>"
+        "<button type=button class='btn bg' onclick=\"fetch('/api/test/pin25?level=0',{method:'POST'})\">GPIO25 LOW 5 s</button>"
         "</div></div>"
         "<div class=fs><h2>Hardware wiring</h2>"
         "<p class=lead>GPS TX/RX are crossed to the ESP32 UART.</p>"
@@ -2988,6 +3014,17 @@ void setupWebServer() {
         delay(150);
         digitalWrite(PIN_BUZZER, ALARM_OFF);
         webServer.send(200, F("application/json"), F("{\"ok\":true}"));
+    });
+
+    // Holds GPIO 25 at a fixed level for 5 s so each level can be heard / measured.
+    webServer.on("/api/test/pin25", HTTP_POST, []() {
+        bool high = webServer.arg("level") == "1";
+        digitalWrite(PIN_BUZZER, high ? HIGH : LOW);
+        pinTestUntilMs = millis() + 5000;
+        showLcdMsg(high ? "GPIO25 = HIGH" : "GPIO25 = LOW", "5 s pin test", 5000);
+        Serial.printf("[TEST] GPIO25 held %s for 5 s\n", high ? "HIGH" : "LOW");
+        webServer.send(200, F("application/json"),
+                       high ? F("{\"ok\":true,\"level\":\"HIGH\"}") : F("{\"ok\":true,\"level\":\"LOW\"}"));
     });
 
     webServer.on("/api/test/leds", HTTP_POST, []() {
