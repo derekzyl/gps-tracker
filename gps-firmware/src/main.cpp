@@ -41,8 +41,6 @@
 #include <TinyGPS++.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
-#include <esp_sleep.h>
-#include <driver/gpio.h>
 #include <qrcode.h>
 
 // ═══════════════════════════════════════════════════════════
@@ -51,7 +49,7 @@
 #define PIN_BUZZER       25
 #define PIN_LED_RED      25
 // GPIO 25 → transistor → 555 alarm stage. Measured on the hardware: HIGH sounds the
-// alarm, LOW silences it. Held at ALARM_OFF through deep sleep.
+// alarm, LOW silences it.
 #define ALARM_ON         HIGH
 #define ALARM_OFF        LOW
 #define PIN_LED_YELLOW   26
@@ -106,9 +104,7 @@
 #define QUEUE_SIZE            12
 #define MAX_DYN_ZONES         16
 #define PARKED_SPEED_KPH      2.0f
-#define PARKED_TIMEOUT_MS     300000UL   // 5 min stationary → deep sleep
-#define SLEEP_DURATION_US     120000000ULL // wake every 2 min to check
-#define WAKE_BTN_PIN          BTN_MENU
+#define PARKED_TIMEOUT_MS     300000UL   // 5 min stationary → LCD off (everything else keeps running)
 
 #define AP_SSID               "GPS-SpeedMonitor"
 #define AP_PASS               "speed1234"
@@ -188,7 +184,8 @@ struct SystemState {
     int     dynZoneCount   = 0;
     uint32_t geofenceVersion = 0;
     unsigned long parkedSinceMs = 0;
-    bool    sleepEnabled   = true;
+    bool    sleepEnabled   = true;   // parked display sleep (LCD off only)
+    bool    displayAsleep  = false;
     unsigned long buzzerMuteUntilMs = 0;
 } state;
 
@@ -299,9 +296,8 @@ static void showLcdMsg(const char* l1, const char* l2, unsigned long ms);
 void setupOTA();
 String serverBaseURL();
 void addApiHeaders(HTTPClient& http);
-void maybeEnterDeepSleep();
-void enterDeepSleep();
-void printWakeReason();
+void maybeSleepDisplay();
+void wakeDisplay(const char* why);
 void updateLCD(const char*, const char*);
 void logViolation(float, float, float, float, int);
 void truncate16(char* dest, const char* src);
@@ -348,17 +344,14 @@ void initLcdGlyphs() {
 }
 
 void setup() {
-    // Silence the alarm first. After deep sleep the pin is still held OFF; configure
-    // the output before releasing the hold so it never floats.
+    // Silence the alarm first, before anything slow runs.
     digitalWrite(PIN_BUZZER, ALARM_OFF);
     pinMode(PIN_BUZZER, OUTPUT);
     digitalWrite(PIN_BUZZER, ALARM_OFF);
-    gpio_hold_dis((gpio_num_t)PIN_BUZZER);
 
     Serial.begin(115200);
     delay(50);
     Serial.println(F("\n=== Velocis Firmware v1.4 — System Starting ==="));
-    printWakeReason();
 
     memset(postQueue, 0, sizeof(postQueue));
 
@@ -481,7 +474,7 @@ void loop() {
                       ESP.getFreeHeap(), state.pendingQueue, state.dynZoneCount);
     }
 
-    maybeEnterDeepSleep();
+    maybeSleepDisplay();
     delay(10);
 }
 
@@ -1133,67 +1126,38 @@ void setupOTA() {
     Serial.println(F("[OTA]  Ready"));
 }
 
-void printWakeReason() {
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    switch (cause) {
-        case ESP_SLEEP_WAKEUP_EXT0:  Serial.println(F("[SLEEP] Wake: MENU button")); break;
-        case ESP_SLEEP_WAKEUP_TIMER: Serial.println(F("[SLEEP] Wake: timer")); break;
-        default: Serial.println(F("[SLEEP] Wake: power-on / reset")); break;
-    }
-}
-
-void enterDeepSleep() {
-    flushPostQueue();
-    if (state.wifiConnected && state.internetOk) {
-        // RAM track buffer is lost in deep sleep: push what we can first.
-        for (int i = 0; i < 3 && trackUnsent > 0; i++)
-            if (!uploadTrack()) break;
-        sendHeartbeat();
-    }
-
-    updateLCD("Parked sleep", "MENU to wake");
-    Serial.printf("[SLEEP] Deep sleep %llu s (parked)\n", SLEEP_DURATION_US / 1000000ULL);
-    delay(400);
-
+// Parked "sleep" = LCD off only. GPS, speed checks, alarm, SMS, Wi-Fi and uploads keep running.
+static void sleepDisplay() {
+    if (state.displayAsleep) return;
     lcd.noBacklight();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-
-    // Keep the alarm pin driven OFF through deep sleep (pins float otherwise → 555 sounds).
-    digitalWrite(PIN_BUZZER, ALARM_OFF);
-    gpio_hold_en((gpio_num_t)PIN_BUZZER);
-    gpio_deep_sleep_hold_en();
-
-    esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US);
-    // MENU (GPIO18) LOW wakes — INPUT_PULLUP, wake on low
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_BTN_PIN, 0);
-    esp_deep_sleep_start();
+    lcd.noDisplay();
+    state.displayAsleep = true;
+    Serial.println(F("[SLEEP] Parked — LCD off (tracking continues)"));
 }
 
-void maybeEnterDeepSleep() {
-    if (!state.sleepEnabled) return;
-    if (state.mode == MODE_PROVISIONING || state.mode == MODE_CONNECTING) return;
-    if (state.pendingQueue > 0) return;          // finish uploads first
-    if (state.violationTier > 0) {               // active alert
-        state.parkedSinceMs = 0;
-        return;
-    }
+void wakeDisplay(const char* why) {
+    state.parkedSinceMs = 0;                     // restart the 5-min countdown
+    if (!state.displayAsleep) return;
+    state.displayAsleep = false;
+    lcd.display();
+    lcd.backlight();
+    renderUi(true);
+    Serial.printf("[SLEEP] LCD on (%s)\n", why);
+}
+
+void maybeSleepDisplay() {
+    if (state.mode == MODE_PROVISIONING || state.mode == MODE_CONNECTING) { wakeDisplay("setup"); return; }
+    if (state.violationTier > 0)                    { wakeDisplay("alert"); return; }
+    if (state.currentSpeed >= PARKED_SPEED_KPH)     { wakeDisplay("moving"); return; }
+    if (!state.sleepEnabled) { if (state.displayAsleep) wakeDisplay("disabled"); return; }
 
     unsigned long now = millis();
-    if (!state.gpsValid) {
-        // No fix yet — don't sleep during acquisition for first 3 minutes
-        if (now < 180000UL) return;
-    }
-
-    if (state.currentSpeed >= PARKED_SPEED_KPH) {
-        state.parkedSinceMs = 0;
-        return;
-    }
+    if (!state.gpsValid && now < 180000UL) return;  // keep the screen on while first acquiring GPS
 
     if (state.parkedSinceMs == 0)
         state.parkedSinceMs = now;
     else if (now - state.parkedSinceMs >= PARKED_TIMEOUT_MS)
-        enterDeepSleep();
+        sleepDisplay();
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1355,6 +1319,7 @@ void renderProvisioningLcd() {
 }
 
 void renderUi(bool force) {
+    if (state.displayAsleep) return;
     unsigned long now = millis();
 
     if (state.mode == MODE_PROVISIONING || state.mode == MODE_CONNECTING) {
@@ -1398,6 +1363,7 @@ void renderUi(bool force) {
 //  MENU   hold → Wi-Fi setup hotspot (3 s, progress bar shown)
 //  SCROLL tap  → previous screen; on LIMIT screen: next limit preset
 //  SCROLL hold → re-init GSM modem (3 s, progress bar shown)
+//  Any press while the LCD is asleep only wakes it.
 // ═══════════════════════════════════════════════════════════
 struct Button {
     uint8_t pin;
@@ -1514,6 +1480,18 @@ void handleButtons() {
     BtnEvent m = pollButton(btnMenu, now);
     BtnEvent s = pollButton(btnScroll, now);
     bool prov = state.mode == MODE_PROVISIONING;
+
+    // With the LCD off, a press only wakes it; that press is ignored until released.
+    static bool wakePress = false;
+    if (state.displayAsleep && (btnMenu.down || btnScroll.down || m != BTN_NONE || s != BTN_NONE)) {
+        wakeDisplay("button");
+        wakePress = true;
+    }
+    if (wakePress) {
+        if (!btnMenu.down && !btnScroll.down) wakePress = false;
+        return;
+    }
+    if (m != BTN_NONE || s != BTN_NONE) state.parkedSinceMs = 0;
 
     drawHoldBar(btnMenu,   "Hold: WiFi setup", now);
     drawHoldBar(btnScroll, "Hold: GSM reset",  now);
@@ -2527,7 +2505,8 @@ void sendDashboard() {
         "<td>Restart GSM modem</td></tr>"
         "</tbody></table></div>"
         "<div class=pbd><p class=hint style='margin:0'>LCD screens: Speed → Limit → Wi-Fi → GPS → Stats. "
-        "While you hold a button a bar fills on the LCD; let go early to cancel.</p></div></div>"));
+        "While you hold a button a bar fills on the LCD; let go early to cancel. "
+        "If the LCD is off (parked), the first press just turns it back on.</p></div></div>"));
 
     // SMS recipients card
     webServer.sendContent(F("<div class='panel'><div class='phd'><h3>SMS recipients</h3>"
@@ -2655,7 +2634,8 @@ void sendSettings() {
     webServer.sendContent(F("'><p class=hint>Must match the key on the Velocis server device registry when REQUIRE_AUTH=true.</p>"
         "<label class=chk><input name=sleepEn type=checkbox value=1"));
     if (state.sleepEnabled) webServer.sendContent(F(" checked"));
-    webServer.sendContent(F("><span>Enable parked deep-sleep (5 min idle → sleep, MENU wakes)</span></label></div>"));
+    webServer.sendContent(F("><span>Parked display sleep: LCD turns off after 5 min parked (GPS, alerts &amp; uploads keep running). "
+        "Any button or driving off turns it back on.</span></label></div>"));
 
     // Hardware Diagnostic Bench
     webServer.sendContent(F(
@@ -2919,6 +2899,7 @@ void sendStatusJSON() {
     doc["limit_setting"]    = cfg.defaultSpeedLimit;
     doc["limit_mode"]       = cfg.autoZones ? "auto" : "manual";
     doc["alarm_muted"]      = millis() < state.buzzerMuteUntilMs;
+    doc["display_asleep"]   = state.displayAsleep;
     doc["violation_tier"]   = state.violationTier;
     doc["gps_valid"]        = state.gpsValid;
     doc["wifi_connected"]   = state.wifiConnected;
@@ -3041,6 +3022,7 @@ void setupWebServer() {
     });
 
     webServer.on("/api/test/lcd", HTTP_POST, []() {
+        wakeDisplay("web test");
         lcd.noBacklight();
         delay(250);
         lcd.backlight();

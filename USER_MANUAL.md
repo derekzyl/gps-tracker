@@ -17,7 +17,7 @@ Velocis is a vehicle speed monitor. A small box in the car reads GPS, compares y
 7. [Online dashboard (server)](#7-online-dashboard-server)
 8. [SMS alerts](#8-sms-alerts)
 9. [Google Maps links](#9-google-maps-links)
-10. [Power saving (parked sleep)](#10-power-saving-parked-sleep)
+10. [Parked display sleep](#10-parked-display-sleep)
 11. [How it works](#11-how-it-works)
 12. [Troubleshooting](#12-troubleshooting)
 13. [Reference](#13-reference)
@@ -107,7 +107,7 @@ Other messages you may see:
 | `Limit from srv / 60 km/h SET` | An admin changed the limit on the online dashboard |
 | `GSM modem: Ready ✓` / `FAILED` | Result of a GSM restart |
 | `Hold: WiFi setup` / `Hold: GSM reset` + bar | You're holding a button — keep holding to confirm, release to cancel |
-| `Parked sleep / MENU to wake` | Going to power-saving sleep |
+| *(screen blank, backlight off)* | Parked display sleep — press any button to turn it back on |
 | `OTA Update...` | Firmware update over Wi-Fi in progress — don't power off |
 
 ---
@@ -116,7 +116,7 @@ Other messages you may see:
 
 | Button | Tap | Hold 3 seconds |
 |---|---|---|
-| **MENU** (GPIO 18) | Next LCD page · **mutes the alarm for 60 s** while it is sounding · wakes the device from sleep | Start **Wi-Fi setup** hotspot |
+| **MENU** (GPIO 18) | Next LCD page · **mutes the alarm for 60 s** while it is sounding | Start **Wi-Fi setup** hotspot |
 | **SCROLL** (GPIO 19) | Previous LCD page · **on the Limit page: next speed limit** | **Restart the GSM modem** |
 
 **Setting the limit with SCROLL:** go to the Limit page (tap MENU until you see `Limit ...`), then each SCROLL tap steps through:
@@ -176,7 +176,7 @@ Change the Wi-Fi network: scan list, name/password, **Save & Connect**, and a QR
 | Section | Options |
 |---|---|
 | Wi-Fi name & password | Change network (clear the name and save to reopen the setup hotspot) |
-| Remote server | Server URL, Device ID, API key, *Enable parked deep-sleep* |
+| Remote server | Server URL, Device ID, API key, *Parked display sleep* |
 | Hardware Diagnostic Bench | Same test buttons as the Live page, plus Mute |
 | Hardware wiring | Pin reference |
 | Speed limit & thresholds | Speed limit (5–250 km/h), AUTO zones, Minor / Moderate / Severe thresholds |
@@ -274,15 +274,18 @@ Send a fake violation (choose device, speed, limit, coordinates) to test the das
 
 ---
 
-## 10. Power saving (parked sleep)
+## 10. Parked display sleep
 
-When enabled (Settings → *Enable parked deep-sleep*, on by default):
+Only the **LCD** sleeps. Everything else stays on all the time: GPS position and speed, speed-limit checks, alarm, SMS, Wi-Fi, the device web console, the GPS log and uploads to the dashboard.
 
-1. If the vehicle stays below 2 km/h for **5 minutes**, the device uploads pending data, shows `Parked sleep / MENU to wake`, turns off the LCD backlight and Wi-Fi, and sleeps.
-2. It wakes by itself every **2 minutes** to check if the vehicle is moving, or immediately when you press **MENU**.
-3. It never sleeps during an alarm, during Wi-Fi setup, while uploads are pending, or in the first 3 minutes when there's no GPS fix yet.
+When enabled (Settings → *Parked display sleep*, on by default):
 
-The alarm output is held off during sleep.
+1. If the vehicle stays below 2 km/h for **5 minutes**, the LCD backlight and text turn off.
+2. The LCD turns back on when you **press any button** (that first press only wakes the screen — it doesn't change page or mute), when the vehicle **starts moving**, or when a **speeding alarm** starts.
+3. Every button press restarts the 5-minute countdown.
+4. The screen never turns off during Wi-Fi setup or in the first 3 minutes while waiting for the first GPS fix.
+
+Untick the setting to keep the LCD on permanently.
 
 ---
 
@@ -371,7 +374,7 @@ All settings (Wi-Fi, server, device ID, limit, mode, thresholds, phone numbers, 
 | `Acquiring GPS` for a long time | Move outdoors / near a window with clear sky. First fix can take 5 min. Check GPS TX→GPIO16, RX→GPIO17. |
 | Can't find the device page | Check the IP on the LCD Wi-Fi page; phone must be on the same network. Hold MENU 3 s to re-run Wi-Fi setup. |
 | `WiFi: no net` | Wi-Fi works but no internet — dashboard won't update; SMS and local page still work. Check the router/hotspot data. |
-| Dashboard shows the device **Offline** | Device has no internet, wrong Server URL, or it's asleep (parked). Server URL must be `http://…/api/violation` with the real host. |
+| Dashboard shows the device **Offline** | Device has no power or internet, or the Server URL is wrong. Server URL must be `http://…/api/violation` with the real host. (A blank LCD doesn't mean offline — the device keeps reporting while the display sleeps.) |
 | **PENDING SYNC** never clears | Device is offline — it picks up the limit on its next heartbeat. |
 | No SMS | Stats page must show `GSM:OK`. Hold SCROLL 3 s (or *Re-init GSM* on SMS Test). Check SIM credit, no SIM PIN, antenna, and SIM800L power (it needs a strong 4 V supply, ~2 A peaks). |
 | Buttons don't respond | Each button: 10 kΩ pull-up to 3.3 V, press connects the pin to GND. Hold (not tap) for setup/GSM actions. |
@@ -406,7 +409,7 @@ All settings (Wi-Fi, server, device ID, limit, mode, thresholds, phone numbers, 
 | Thresholds | Minor 1, Moderate 10, Severe 20 km/h over |
 | SMS cooldown | 30 s |
 | Heartbeat / track upload / zone sync | 30 s / 15 s / 5 min |
-| Parked sleep | after 5 min below 2 km/h; wake every 2 min or MENU |
+| Parked display sleep | LCD off after 5 min below 2 km/h; any button, moving or an alarm turns it on |
 | Firmware update | Over Wi-Fi (Arduino OTA, hostname = Device ID) or USB |
 
 ### Device API (local network)
